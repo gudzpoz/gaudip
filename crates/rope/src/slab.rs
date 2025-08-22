@@ -53,7 +53,7 @@ pub struct SlabRedBlack<T> {
 
 impl<T> SlabRedBlack<T>
 where
-    T: std::cmp::PartialOrd,
+    T: PartialOrd,
 {
     fn rotate(&mut self, x: usize, dir: usize) {
         let y = self.slab[x].children[dir ^ 1];
@@ -264,7 +264,7 @@ where
 
 impl<T> RedBlack<T> for SlabRedBlack<T>
 where
-    T: std::cmp::PartialOrd,
+    T: PartialOrd,
 {
     fn new() -> SlabRedBlack<T> {
         let mut rb = SlabRedBlack {
@@ -283,11 +283,37 @@ where
         rb
     }
 
-    fn search(&mut self, key: &T) -> Option<&T> {
-        if let Some(found_idx) = self.search_(key) {
-            return Some(&self.slab[found_idx].key);
+    fn insert(&mut self, key: T) {
+        let z = self.slab.insert(Node::new(key, self.nil_sentinel));
+
+        let mut y = self.nil_sentinel;
+        let mut x = self.root;
+
+        while x != self.nil_sentinel {
+            y = x;
+            let dir = if self.slab[z].key < self.slab[x].key {
+                0
+            } else {
+                1
+            };
+            x = self.slab[x].children[dir];
         }
-        None
+
+        self.slab[z].parent = y;
+        if y == self.nil_sentinel {
+            self.root = z;
+        } else {
+            let dir = if self.slab[z].key < self.slab[y].key {
+                0
+            } else {
+                1
+            };
+            self.slab[y].children[dir] = z;
+        }
+
+        self.slab[z].red = true;
+
+        self.insert_fixup(z);
     }
 
     fn delete(&mut self, key: &T) {
@@ -338,37 +364,11 @@ where
         }
     }
 
-    fn insert(&mut self, key: T) {
-        let z = self.slab.insert(Node::new(key, self.nil_sentinel));
-
-        let mut y = self.nil_sentinel;
-        let mut x = self.root;
-
-        while x != self.nil_sentinel {
-            y = x;
-            let dir = if self.slab[z].key < self.slab[x].key {
-                0
-            } else {
-                1
-            };
-            x = self.slab[x].children[dir];
+    fn search(&mut self, key: &T) -> Option<&T> {
+        if let Some(found_idx) = self.search_(key) {
+            return Some(&self.slab[found_idx].key);
         }
-
-        self.slab[z].parent = y;
-        if y == self.nil_sentinel {
-            self.root = z;
-        } else {
-            let dir = if self.slab[z].key < self.slab[y].key {
-                0
-            } else {
-                1
-            };
-            self.slab[y].children[dir] = z;
-        }
-
-        self.slab[z].red = true;
-
-        self.insert_fixup(z);
+        None
     }
 }
 
