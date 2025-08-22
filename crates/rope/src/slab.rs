@@ -18,180 +18,208 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-const NULL: usize = !0;
-
 use crate::redblack::RedBlack;
 use slab::Slab;
 use std::mem;
+use std::ops::{Index, IndexMut};
 
 #[cfg(test)]
 use std::collections::VecDeque;
 
+#[derive(Eq, PartialEq, Copy, Clone)]
+#[cfg_attr(test, derive(Debug))]
+struct Ref(usize);
+impl Ref {
+    const fn sentinel() -> Self {
+        Self(0)
+    }
+    fn is_sentinel(&self) -> bool {
+        self.0 == 0
+    }
+}
+const SENTINEL: Ref = Ref::sentinel();
+
 struct Node<T> {
-    parent: usize,
-    children: [usize; 2],
+    parent: Ref,
+    children: [Ref; 2],
     key: T,
     red: bool,
 }
 
 impl<T> Node<T> {
-    fn new(key: T, nil_sentinel: usize) -> Node<T> {
+    fn new(key: T) -> Node<T> {
         Node {
-            parent: nil_sentinel,
-            children: [nil_sentinel, nil_sentinel],
+            parent: SENTINEL,
+            children: [SENTINEL, SENTINEL],
             key,
             red: false,
         }
     }
 }
 
-pub struct SlabRedBlack<T> {
+pub struct SlabRedBlack<T: PartialOrd> {
     slab: Slab<Node<T>>,
-    root: usize,
-    nil_sentinel: usize,
+    root: Ref,
+}
+
+impl<T: PartialOrd> Index<Ref> for SlabRedBlack<T> {
+    type Output = Node<T>;
+
+    fn index(&self, index: Ref) -> &Self::Output {
+        &self.slab[index.0]
+    }
+}
+impl<T: PartialOrd> IndexMut<Ref> for SlabRedBlack<T> {
+    fn index_mut(&mut self, index: Ref) -> &mut Self::Output {
+        &mut self.slab[index.0]
+    }
 }
 
 impl<T> SlabRedBlack<T>
 where
     T: PartialOrd,
 {
-    fn rotate(&mut self, x: usize, dir: usize) {
-        let y = self.slab[x].children[dir ^ 1];
-        self.slab[x].children[dir ^ 1] = self.slab[y].children[dir];
-        let y_chld = self.slab[y].children[dir];
-        if y_chld != self.nil_sentinel {
-            self.slab[y_chld].parent = x;
-        }
-        self.slab[y].parent = self.slab[x].parent;
-        let x_parent = self.slab[x].parent;
-        if x_parent == self.nil_sentinel {
-            self.root = y;
+    fn replace(&mut self, node: Ref, with: Ref) {
+        let parent = self[node].parent;
+        self[with].parent = parent;
+        if parent.is_sentinel() {
+            self.root = with;
         } else {
-            let sib_dir = if self.slab[x_parent].children[0] == x {
-                0
-            } else {
-                1
-            };
-            self.slab[x_parent].children[sib_dir] = y;
+            let parent = &mut self[parent];
+            let dir = if parent.children[0] == node { 0 } else { 1 };
+            parent.children[dir] = with;
         }
-        self.slab[y].children[dir] = x;
-        self.slab[x].parent = y;
     }
 
-    fn tree_minimum(&mut self, mut x: usize) -> usize {
-        let mut l = self.slab[x].children[0];
-        while l != self.nil_sentinel {
+    fn rotate(&mut self, x: Ref, dir: usize) {
+        debug_assert!(dir == 0 || dir == 1);
+        let dir = dir & 1;
+        let y = self[x].children[dir ^ 1];
+        self[x].children[dir ^ 1] = self[y].children[dir];
+        let y_child = self[y].children[dir];
+        if !y_child.is_sentinel() {
+            self[y_child].parent = x;
+        }
+        self.replace(x, y);
+        self[y].children[dir] = x;
+        self[x].parent = y;
+    }
+
+    fn tree_leftest(&self, mut x: Ref) -> Ref {
+        let mut l = self[x].children[0];
+        while !l.is_sentinel() {
             x = l;
-            l = self.slab[x].children[0];
+            l = self[x].children[0];
         }
         x
     }
 
-    fn tree_successor(&mut self, mut x: usize) -> usize {
-        if self.slab[x].children[1] != self.nil_sentinel {
-            return self.tree_minimum(x);
+    fn tree_successor(&self, mut x: Ref) -> Ref {
+        if !self[x].children[1].is_sentinel() {
+            return self.tree_leftest(x);
         }
-        let mut y = self.slab[x].parent;
-        while y != self.nil_sentinel && x == self.slab[y].children[1] {
+        let mut y = self[x].parent;
+        while !y.is_sentinel() && x == self[y].children[1] {
             x = y;
-            y = self.slab[y].parent;
+            y = self[y].parent;
         }
         y
     }
 
-    fn insert_fixup(&mut self, mut z: usize) {
-        let mut p = self.slab[z].parent;
-        let mut pp: usize;
+    fn insert_fixup(&mut self, mut z: Ref) {
+        let mut p = self[z].parent;
+        let mut pp: Ref;
 
-        while self.slab[p].red {
-            p = self.slab[z].parent;
-            pp = self.slab[p].parent;
+        while self[p].red {
+            p = self[z].parent;
+            pp = self[p].parent;
 
-            let dir = if self.slab[pp].children[0] == p { 1 } else { 0 };
+            let dir = if self[pp].children[0] == p { 1 } else { 0 };
 
-            let y = self.slab[pp].children[dir];
+            let y = self[pp].children[dir];
 
-            if self.slab[y].red {
-                self.slab[p].red = false;
-                self.slab[y].red = false;
-                self.slab[pp].red = true;
+            if self[y].red {
+                self[p].red = false;
+                self[y].red = false;
+                self[pp].red = true;
                 z = pp;
 
                 // recompute parent and grandparent after changing z
-                p = self.slab[z].parent;
+                p = self[z].parent;
             } else {
                 // y is black, or nil sentinel
-                if z == self.slab[p].children[dir] {
+                if z == self[p].children[dir] {
                     z = p;
 
                     self.rotate(z, dir ^ 1);
 
                     // recompute parent and grandparent after rotation
-                    p = self.slab[z].parent;
-                    pp = self.slab[p].parent;
+                    p = self[z].parent;
+                    pp = self[p].parent;
                 }
-                self.slab[p].red = false;
-                self.slab[pp].red = true;
+                self[p].red = false;
+                self[pp].red = true;
                 self.rotate(pp, dir);
             }
         }
 
         // blacken the root
-        self.slab[self.root].red = false;
+        let root = self.root;
+        self[root].red = false;
     }
 
-    fn delete_fixup(&mut self, mut x: usize) {
-        let mut p: usize;
-        while x != self.root && !self.slab[x].red {
-            p = self.slab[x].parent;
-            let dir = if x == self.slab[p].children[0] { 1 } else { 0 };
-            let mut w = self.slab[p].children[dir];
-            if self.slab[w].red {
-                self.slab[w].red = false;
-                self.slab[p].red = true;
+    fn delete_fixup(&mut self, mut x: Ref) {
+        let mut p: Ref;
+        while x != self.root && !self[x].red {
+            p = self[x].parent;
+            let dir = if x == self[p].children[0] { 1 } else { 0 };
+            let mut w = self[p].children[dir];
+            if self[w].red {
+                self[w].red = false;
+                self[p].red = true;
                 self.rotate(p, dir ^ 1);
 
                 // recompute w after the rotation of p
-                w = self.slab[p].children[dir];
+                w = self[p].children[dir];
             }
-            let wl = self.slab[w].children[0];
-            let wr = self.slab[w].children[1];
-            if !self.slab[wl].red && !self.slab[wr].red {
-                self.slab[w].red = true;
+            let wl = self[w].children[0];
+            let wr = self[w].children[1];
+            if !self[wl].red && !self[wr].red {
+                self[w].red = true;
                 x = p;
             } else {
-                let mut wc = self.slab[w].children[dir]; // w child i care about
-                let wo = self.slab[w].children[dir ^ 1]; // w other child
-                if !self.slab[wc].red {
-                    self.slab[wo].red = false;
-                    self.slab[w].red = true;
+                let mut wc = self[w].children[dir]; // w child i care about
+                let wo = self[w].children[dir ^ 1]; // w other child
+                if !self[wc].red {
+                    self[wo].red = false;
+                    self[w].red = true;
                     self.rotate(w, dir);
-                    w = self.slab[p].children[dir];
+                    w = self[p].children[dir];
 
                     // recompute wc after the rotation of w
-                    wc = self.slab[w].children[dir];
+                    wc = self[w].children[dir];
                 }
-                self.slab[w].red = self.slab[p].red;
-                self.slab[p].red = false;
-                self.slab[wc].red = false;
+                self[w].red = self[p].red;
+                self[p].red = false;
+                self[wc].red = false;
                 self.rotate(p, dir ^ 1);
                 x = self.root
             }
         }
 
         // blacken x
-        self.slab[x].red = false;
+        self[x].red = false;
     }
 
-    fn search_(&mut self, key: &T) -> Option<usize> {
+    fn search_(&mut self, key: &T) -> Option<Ref> {
         let mut curr = self.root;
 
-        while curr != self.nil_sentinel {
-            if self.slab[curr].key == *key {
+        while !curr.is_sentinel() {
+            if self[curr].key == *key {
                 return Some(curr);
             }
-            let direction = if self.slab[curr].key < *key { 1 } else { 0 };
-            curr = self.slab[curr].children[direction];
+            let direction = if self[curr].key < *key { 1 } else { 0 };
+            curr = self[curr].children[direction];
         }
         None
     }
@@ -205,50 +233,47 @@ where
          * - red property: children of a red node are black
          * - simple path from node to descendant leaf contains same number of black nodes
          */
-        fn verify_black_height<T>(rb: &SlabRedBlack<T>, x: usize) -> i32 {
-            if x == rb.nil_sentinel {
+        fn verify_black_height<T: PartialOrd>(rb: &SlabRedBlack<T>, x: Ref) -> i32 {
+            if x.is_sentinel() {
                 return 0;
             }
-            let left_height = verify_black_height(rb, rb.slab[x].children[0]);
-            let right_height = verify_black_height(rb, rb.slab[x].children[1]);
+            let left_height = verify_black_height(rb, rb[x].children[0]);
+            let right_height = verify_black_height(rb, rb[x].children[1]);
 
             assert!(
                 left_height != -1 && right_height != -1 && left_height == right_height,
                 "red-black properties have been violated!"
             );
 
-            let add = if rb.slab[x].red { 0 } else { 1 };
+            let add = if rb[x].red { 0 } else { 1 };
             left_height + add
         }
 
-        fn verify_children_color<T>(rb: &SlabRedBlack<T>) -> bool {
-            if rb.root == rb.nil_sentinel {
+        fn verify_children_color<T: PartialOrd>(rb: &SlabRedBlack<T>) -> bool {
+            if rb.root.is_sentinel() {
                 return true;
             }
-            let mut queue: VecDeque<usize> = VecDeque::new();
+            let mut queue: VecDeque<Ref> = VecDeque::new();
             queue.push_front(rb.root);
 
             while !queue.is_empty() {
                 let curr = queue.pop_front().unwrap();
-                if curr == rb.nil_sentinel {
+                if curr.is_sentinel() {
                     break;
                 }
 
-                let l = rb.slab[curr].children[0];
-                let r = rb.slab[curr].children[1];
+                let l = rb[curr].children[0];
+                let r = rb[curr].children[1];
 
                 // red node must not have red children
-                if rb.slab[curr].red {
-                    assert!(
-                        !rb.slab[l].red && !rb.slab[r].red,
-                        "red node has red children"
-                    );
+                if rb[curr].red {
+                    assert!(!rb[l].red && !rb[r].red, "red node has red children");
                 }
 
-                if l != rb.nil_sentinel {
+                if !l.is_sentinel() {
                     queue.push_back(l);
                 }
-                if r != rb.nil_sentinel {
+                if !r.is_sentinel() {
                     queue.push_back(r);
                 }
             }
@@ -256,7 +281,7 @@ where
             true
         }
 
-        assert!(!self.slab[self.root].red); // root is black
+        assert!(!self[self.root].red); // root is black
         verify_children_color(self);
         verify_black_height(self, self.root);
     }
@@ -269,49 +294,39 @@ where
     fn new() -> SlabRedBlack<T> {
         let mut rb = SlabRedBlack {
             slab: Slab::new(),
-            root: NULL,
-            nil_sentinel: NULL,
+            root: SENTINEL,
         };
-        unsafe {
-            let nil_sentinel = rb.slab.insert(Node::new(
-                mem::MaybeUninit::<T>::uninit().assume_init(),
-                NULL,
-            ));
-            rb.nil_sentinel = nil_sentinel;
-            rb.root = nil_sentinel;
-        }
+        let index = rb.slab.insert(Node {
+            parent: SENTINEL,
+            children: [SENTINEL, SENTINEL],
+            key: unsafe { mem::zeroed() },
+            red: false,
+        });
+        assert_eq!(index, 0);
         rb
     }
 
     fn insert(&mut self, key: T) {
-        let z = self.slab.insert(Node::new(key, self.nil_sentinel));
+        let z = Ref(self.slab.insert(Node::new(key)));
 
-        let mut y = self.nil_sentinel;
+        let mut y = SENTINEL;
         let mut x = self.root;
 
-        while x != self.nil_sentinel {
+        while x != SENTINEL {
             y = x;
-            let dir = if self.slab[z].key < self.slab[x].key {
-                0
-            } else {
-                1
-            };
-            x = self.slab[x].children[dir];
+            let dir = if self[z].key < self[x].key { 0 } else { 1 };
+            x = self[x].children[dir];
         }
 
-        self.slab[z].parent = y;
-        if y == self.nil_sentinel {
+        self[z].parent = y;
+        if y.is_sentinel() {
             self.root = z;
         } else {
-            let dir = if self.slab[z].key < self.slab[y].key {
-                0
-            } else {
-                1
-            };
-            self.slab[y].children[dir] = z;
+            let dir = if self[z].key < self[y].key { 0 } else { 1 };
+            self[y].children[dir] = z;
         }
 
-        self.slab[z].red = true;
+        self[z].red = true;
 
         self.insert_fixup(z);
     }
@@ -324,49 +339,37 @@ where
             }
         };
 
-        let y = if self.slab[z].children[0] == self.nil_sentinel
-            || self.slab[z].children[1] == self.nil_sentinel
-        {
+        let y = if self[z].children[0].is_sentinel() || self[z].children[1].is_sentinel() {
             z
         } else {
             self.tree_successor(z)
         };
 
-        let dir = if self.slab[y].children[0] != self.nil_sentinel {
-            0
-        } else {
+        let dir = if self[y].children[0].is_sentinel() {
             1
-        };
-        let x = self.slab[y].children[dir];
-
-        let yp = self.slab[y].parent;
-
-        self.slab[x].parent = yp;
-
-        if yp == self.nil_sentinel {
-            self.root = x;
         } else {
-            let dir = if y == self.slab[yp].children[0] { 0 } else { 1 };
-            self.slab[yp].children[dir] = x;
-        }
+            0
+        };
+        let x = self[y].children[dir];
+        self.replace(y, x);
 
-        if !self.slab[y].red {
+        if !self[y].red {
             self.delete_fixup(x);
         }
 
-        if y == self.nil_sentinel {
+        if y.is_sentinel() {
             return;
         }
 
-        let mut y_removed = self.slab.remove(y); // remove the spliced-out node from the slab
+        let mut y_removed = self.slab.remove(y.0); // remove the spliced-out node from the slab
         if y != z {
-            mem::swap(&mut self.slab[z].key, &mut y_removed.key);
+            mem::swap(&mut self[z].key, &mut y_removed.key);
         }
     }
 
     fn search(&mut self, key: &T) -> Option<&T> {
         if let Some(found_idx) = self.search_(key) {
-            return Some(&self.slab[found_idx].key);
+            return Some(&self[found_idx].key);
         }
         None
     }
@@ -410,30 +413,30 @@ mod tests {
          */
 
         assert_eq!(rb.slab[1].key, 5);
-        assert_eq!(rb.slab[1].parent, rb.nil_sentinel);
-        assert_eq!(rb.slab[1].children[0], 2); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].children[1], 3); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab[1].parent, SENTINEL);
+        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab[1].children[1], Ref(3)); // x's right points to 3 in the slab i.e. y
 
         assert_eq!(rb.slab[2].key, 1);
-        assert_eq!(rb.slab[2].parent, 1);
-        assert_eq!(rb.slab[2].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[2].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[2].parent, Ref(1));
+        assert_eq!(rb.slab[2].children[0], SENTINEL);
+        assert_eq!(rb.slab[2].children[1], SENTINEL);
 
         assert_eq!(rb.slab[3].key, 8);
-        assert_eq!(rb.slab[3].parent, 1);
-        assert_eq!(rb.slab[3].children[0], 4); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].children[1], 5); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab[3].parent, Ref(1));
+        assert_eq!(rb.slab[3].children[0], Ref(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right points to 5 in the slab i.e. gamma
 
         assert_eq!(rb.slab[4].key, 7);
-        assert_eq!(rb.slab[4].parent, 3);
-        assert_eq!(rb.slab[4].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[4].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[4].parent, Ref(3));
+        assert_eq!(rb.slab[4].children[0], SENTINEL);
+        assert_eq!(rb.slab[4].children[1], SENTINEL);
         assert_eq!(rb.slab[5].key, 9);
-        assert_eq!(rb.slab[5].parent, 3);
-        assert_eq!(rb.slab[5].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[5].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[5].parent, Ref(3));
+        assert_eq!(rb.slab[5].children[0], SENTINEL);
+        assert_eq!(rb.slab[5].children[1], SENTINEL);
 
-        rb.rotate(1, 0); // left-rotate x
+        rb.rotate(Ref(1), 0); // left-rotate x
 
         /*
          *      y
@@ -447,41 +450,41 @@ mod tests {
 
         assert_eq!(rb.slab[1].key, 5);
         assert_eq!(rb.slab[2].key, 1);
-        assert_eq!(rb.slab[1].parent, 3); // x's new parent is y
-        assert_eq!(rb.slab[3].children[0], 1); // y's left child is x
-        assert_eq!(rb.slab[3].children[1], 5); // y's right child is gamma
+        assert_eq!(rb.slab[1].parent, Ref(3)); // x's new parent is y
+        assert_eq!(rb.slab[3].children[0], Ref(1)); // y's left child is x
+        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right child is gamma
         assert_eq!(rb.slab[5].key, 9);
-        assert_eq!(rb.slab[5].parent, 3);
-        assert_eq!(rb.slab[1].children[0], 2); // x's left child is alpha
-        assert_eq!(rb.slab[1].children[1], 4); // x's right child is beta
-        assert_eq!(rb.slab[2].parent, 1); // alpha's parent is x
-        assert_eq!(rb.slab[4].parent, 1); // beta's parent is x
+        assert_eq!(rb.slab[5].parent, Ref(3));
+        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left child is alpha
+        assert_eq!(rb.slab[1].children[1], Ref(4)); // x's right child is beta
+        assert_eq!(rb.slab[2].parent, Ref(1)); // alpha's parent is x
+        assert_eq!(rb.slab[4].parent, Ref(1)); // beta's parent is x
 
-        rb.rotate(3, 1); // right-rotate y brings our tree back to the original
+        rb.rotate(Ref(3), 1); // right-rotate y brings our tree back to the original
 
         assert_eq!(rb.slab[1].key, 5);
-        assert_eq!(rb.slab[1].parent, rb.nil_sentinel);
-        assert_eq!(rb.slab[1].children[0], 2); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].children[1], 3); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab[1].parent, SENTINEL);
+        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab[1].children[1], Ref(3)); // x's right points to 3 in the slab i.e. y
 
         assert_eq!(rb.slab[2].key, 1);
-        assert_eq!(rb.slab[2].parent, 1);
-        assert_eq!(rb.slab[2].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[2].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[2].parent, Ref(1));
+        assert_eq!(rb.slab[2].children[0], SENTINEL);
+        assert_eq!(rb.slab[2].children[1], SENTINEL);
 
         assert_eq!(rb.slab[3].key, 8);
-        assert_eq!(rb.slab[3].parent, 1);
-        assert_eq!(rb.slab[3].children[0], 4); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].children[1], 5); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab[3].parent, Ref(1));
+        assert_eq!(rb.slab[3].children[0], Ref(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right points to 5 in the slab i.e. gamma
 
         assert_eq!(rb.slab[4].key, 7);
-        assert_eq!(rb.slab[4].parent, 3);
-        assert_eq!(rb.slab[4].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[4].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[4].parent, Ref(3));
+        assert_eq!(rb.slab[4].children[0], SENTINEL);
+        assert_eq!(rb.slab[4].children[1], SENTINEL);
         assert_eq!(rb.slab[5].key, 9);
-        assert_eq!(rb.slab[5].parent, 3);
-        assert_eq!(rb.slab[5].children[0], rb.nil_sentinel);
-        assert_eq!(rb.slab[5].children[1], rb.nil_sentinel);
+        assert_eq!(rb.slab[5].parent, Ref(3));
+        assert_eq!(rb.slab[5].children[0], SENTINEL);
+        assert_eq!(rb.slab[5].children[1], SENTINEL);
     }
 
     #[test]
