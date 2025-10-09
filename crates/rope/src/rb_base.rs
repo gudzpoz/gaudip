@@ -53,7 +53,7 @@ use std::ops::{Index, IndexMut};
 // if we are to make such a change.
 #[derive(Eq, PartialEq, Copy, Clone)]
 #[cfg_attr(test, derive(Debug))]
-pub struct Ref(pub usize);
+pub(crate) struct Ref(pub usize);
 impl Ref {
     pub fn is_sentinel(&self) -> bool {
         self.0 == 0

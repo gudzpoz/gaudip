@@ -1,12 +1,14 @@
+use crate::rb_base::Ref;
+
 /// Summary for a [Summable]
 ///
 /// For string ropes, this will typically include lengths,
 /// line counts, etc.
 ///
 /// It is assumed that this sum has the following properties:
-/// - Associativity
-/// - Commutativity
-/// - Has an identity element
+/// - Associativity: `(len1 + len2) + len3 == len1 + (len2 + len3)`
+/// - Commutativity: `len1 + len2 == len2 + len1`
+/// - Has an identity element: [Sum::identity]
 /// - Has inverse elements ([Sum::add_assign] versus [Sum::sub_assign])
 // We allow zero-length pieces, and an is_empty function
 // can be confusing at least.
@@ -73,8 +75,11 @@ pub trait RopePiece: Summable + Sized {
     /// holder piece buffers. This will be passed as a context argument
     /// when calling functions of this trait.
     ///
+    /// Methods of the same [RopePiece] instance will always receive
+    /// the same context object, as is returned by [crate::roperig::Rope::context].
+    ///
     /// [piece tree]: https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
-    type Context: Default;
+    type Context: RopeContext<Self>;
 
     /// Precondition to [Self::insert_or_split] when deleting nodes
     /// 
@@ -102,4 +107,51 @@ pub trait RopePiece: Summable + Sized {
     ///
     /// If the current node should be deleted as a whole, return `None`.
     fn delete_range(&mut self, context: &mut Self::Context, from: usize, to: usize) -> Option<Self::S>;
+}
+
+/// A reference to internal nodes, inherently unsafe
+///
+/// ## Safety
+///
+/// The user (ref holder) is responsible for keeping track of
+/// the lifetime of this reference by either:
+/// - Do not modify the rope before dropping the reference.
+/// - Make sure to drop the reference when [RopeContext::on_deletion]
+///   is called with it.
+///
+/// Internally, this reference is used as indices, and we trust the user
+/// and don't perform (or guarantee) much validation.
+///
+/// ## Usage
+///
+/// This is typically used as references to markers. For example, in Emacs,
+/// you can obtain references to markers and extract their positions.
+///
+/// A recommended way to use transient refs is to record external references
+/// in [RopeContext::on_insertion] and delete them when [RopeContext::on_deletion]
+/// is called.
+#[derive(Clone)]
+pub struct TransientRef(Ref);
+
+#[allow(clippy::from_over_into)]
+impl Into<usize> for TransientRef {
+    fn into(self) -> usize {
+        self.0.0
+    }
+}
+
+/// Context object for a rope
+///
+/// Usually used by ropes to store external data, if any.
+///
+/// The main purpose of the [RopeContext::on_insertion] and
+/// [RopeContext::on_deletion] APIs is to allow safe references to
+/// certain nodes in the tree. This might be useful to markers.
+pub trait RopeContext<R: RopePiece>: Default {
+    /// Called when a new node is inserted into the tree
+    fn on_insertion(&mut self, _piece: &mut R, _node: TransientRef) {
+    }
+    /// Called when a node is deleted from the tree
+    fn on_deletion(&mut self, _piece: R, _node: TransientRef) {
+    }
 }
