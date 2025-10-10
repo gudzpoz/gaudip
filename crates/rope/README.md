@@ -50,7 +50,6 @@ text representation* of Juicemacs clients. It should support:
   line) and insertion should be handled by the user.
 
 It should be possible to implement actual string ropes (and piece tables/trees
-too!) with this crate.
+too!) with this crate (via an externally supplied context object).
 
 [Rope]: https://en.wikipedia.org/wiki/Rope_(data_structure)
-

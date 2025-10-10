@@ -41,11 +41,11 @@
 
 // See crates/rope/LICENSE for more license information.
 
+use crate::metrics::{rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
+use crate::piece::{RopePiece, SplitResult, Sum};
+use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT};
 use std::collections::VecDeque;
 use std::ops::Range;
-use crate::metrics::{BaseMetric, Cursor, Metric};
-use crate::piece::{RopePiece, SplitResult, Sum, Summable};
-use crate::rb_base::{Node, RbSlab, Ref, LEFT, RIGHT};
 
 /// The rope implementation
 pub struct Rope<T: RopePiece> {
@@ -59,15 +59,11 @@ impl<T: RopePiece> Default for Rope<T> {
     }
 }
 
-pub(crate) struct NodePosition {
-    pub node: Ref,
-    pub in_node_offset: usize,
-}
 /// Information about a particular position in tree
 pub struct PiecePosition<'a, T> {
     /// The piece that the position lies in
     pub piece: &'a T,
-    /// The relative offset of the position
+    /// The relative offset of the position in base metric
     ///
     /// This offset can be at the end of the piece (`piece.len()`).
     pub offset_in_piece: usize,
@@ -87,6 +83,30 @@ impl<T: RopePiece> Rope<T> {
     pub fn context(&mut self) -> &mut T::Context {
         &mut self.context
     }
+    
+    /// Check if the rope contains nothing
+    pub fn is_empty(&self) -> bool {
+        self.tree.root.is_none()
+    }
+    
+    /// Returns the length of the rope
+    /// 
+    /// Note that we allow zero-length nodes, like markers.
+    /// So zero-length does not imply an empty tree.
+    /// Use [Self::is_empty] for empty checking.
+    pub fn len(&self) -> usize {
+        self.sum.len()
+    }
+    
+    /// Return the measurement of the whole tree
+    pub fn measure<M: Metric<T>>(&self) -> usize {
+        M::measure(&self.sum)
+    }
+    
+    /// Converts offsets from one measurement to another
+    pub fn convert_metrics<M: Metric<T>, N: Metric<T>>(&self, measurement: usize) -> Option<usize> {
+        self.cursor::<M>(measurement).map(|c| c.offset::<N>())
+    }
 
     /// Batch insert multiple values at consecutive nodes
     pub fn init(&mut self, mut value: VecDeque<T>) {
@@ -97,25 +117,21 @@ impl<T: RopePiece> Rope<T> {
         }
     }
 
-    /// Insert a node with `value` at `offset`
+    /// Insert a node with `value` at `offset` in base metric
     pub fn insert(&mut self, offset: usize, value: T) {
+        self.insert_at(self.node_at_metric::<BaseMetric>(offset), value);
+    }
+    pub(crate) fn insert_at(&mut self, pos: Option<CursorPos<T>>, value: T) {
         let summary = value.summarize();
         self.sum.add_assign(&summary);
-        if self.tree.root.is_sentinel() {
-            assert_eq!(offset, 0);
-            self.rb_insert(None, value, LEFT);
+        if let Some(pos) = pos {
+            self.insert_at_around(pos.node, pos.offset_in_node, value, true);
         } else {
-            let NodePosition {
-                node, in_node_offset: remainder, ..
-            } = self.node_at(offset).unwrap();
-            self.insert_at(node, remainder, value);
+            self.rb_insert(None, value, LEFT);
         }
     }
 
-    fn insert_at(&mut self, node: Ref, remainder: usize, value: T) {
-        self.insert_at_around(node, remainder, value, true);
-    }
-    fn insert_at_around(&mut self, node: Ref, remainder: usize, value: T, retry: bool) -> Ref {
+    fn insert_at_around(&mut self, node: SafeRef, remainder: usize, value: T, retry: bool) -> SafeRef {
         let obj = &mut self.tree[node];
         let mut summary = value.summarize();
         match obj.piece.insert_or_split(&mut self.context, value, remainder) {
@@ -146,11 +162,10 @@ impl<T: RopePiece> Rope<T> {
             }
         }
     }
-
-    fn try_other_edge(&mut self, node: Ref, retry: bool, value: T, dir: usize) -> Ref {
+    fn try_other_edge(&mut self, node: SafeRef, retry: bool, value: T, dir: usize) -> SafeRef {
         if retry {
             let other = self.tree.next(node, dir);
-            if !other.is_sentinel() {
+            if let Some(other) = other {
                 let at = if dir == LEFT {
                     self.tree[other].piece.summarize().len()
                 } else {
@@ -171,7 +186,7 @@ impl<T: RopePiece> Rope<T> {
         let end = self.node_at(offset + len).unwrap();
         if start.node == end.node {
             let summary = self.tree[start.node].piece.delete_range(
-                &mut self.context, start.in_node_offset, end.in_node_offset,
+                &mut self.context, start.offset_in_node, end.offset_in_node,
             );
             if let Some(summary) = summary {
                 // This fast path doesn't call recompute_metadata,
@@ -186,7 +201,7 @@ impl<T: RopePiece> Rope<T> {
 
         let mut del_nodes = vec![];
         let mut del_or_keep =
-            |this: &mut Self, node: Ref, range: Range<usize>| -> bool {
+            |this: &mut Self, node: SafeRef, range: Range<usize>| -> bool {
                 let piece = &mut this.tree[node].piece;
                 let summary = piece.delete_range(
                     &mut this.context, range.start, if range.end == usize::MAX {
@@ -207,40 +222,39 @@ impl<T: RopePiece> Rope<T> {
             };
 
         let merge_head = if del_or_keep(
-            self, start.node, start.in_node_offset..usize::MAX,
+            self, start.node, start.offset_in_node..usize::MAX,
         ) {
             self.tree.next(start.node, LEFT)
         } else {
-            start.node
+            Some(start.node)
         };
 
-        let merge_end = if del_or_keep(self, end.node, 0..end.in_node_offset) {
+        let merge_end = if del_or_keep(self, end.node, 0..end.offset_in_node) {
             self.tree.next(end.node, RIGHT)
         } else {
-            end.node
+            Some(end.node)
         };
 
         let mut del_i = self.tree.next(start.node, RIGHT);
-        while !del_i.is_sentinel() && del_i != end.node {
-            del_or_keep(self, del_i, 0..usize::MAX);
-            del_i = self.tree.next(del_i, RIGHT);
+        while let Some(del_i_) = del_i && del_i_ != end.node {
+            del_or_keep(self, del_i_, 0..usize::MAX);
+            del_i = self.tree.next(del_i_, RIGHT);
         }
         self.delete_nodes(del_nodes);
 
-        let mut merge_i = merge_head;
-        while !merge_head.is_sentinel() && merge_i != merge_end {
-            let next = self.tree.next(merge_i, RIGHT);
-            if next.is_sentinel() {
-                break;
-            }
-            if self.tree[merge_head].piece.must_try_merging(&mut self.context, &self.tree[next].piece) {
-                let tail = self.tree.delete(next);
-                self.insert_at(merge_head, self.tree[merge_head].piece.summarize().len(), tail);
-            } else {
-                merge_i = next;
-            }
-            if next == merge_end {
-                break;
+        if let Some(merge_head) = merge_head {
+            let mut merge_i = merge_head;
+            loop {
+                let Some(next) = self.tree.next(merge_i, RIGHT) else { break; };
+                if self.tree[merge_head].piece.must_try_merging(&mut self.context, &self.tree[next].piece) {
+                    let tail = self.tree.delete(next);
+                    self.insert_at_around(merge_head, self.tree[merge_head].piece.summarize().len(), tail, true);
+                } else {
+                    merge_i = next;
+                }
+                if Some(next) == merge_end {
+                    break;
+                }
             }
         }
 
@@ -248,9 +262,9 @@ impl<T: RopePiece> Rope<T> {
     }
 
     /// Locate an offset in the current tree
-    pub fn search(&self, offset: usize) -> Option<PiecePosition<T>> {
-        if let Some(NodePosition { node, in_node_offset }) = self.node_at(offset) {
-            Some(PiecePosition { piece: &self.tree[node].piece, offset_in_piece: in_node_offset })
+    pub fn search(&self, offset: usize) -> Option<PiecePosition<'_, T>> {
+        if let Some(CursorPos { node, offset_in_node, .. }) = self.node_at(offset) {
+            Some(PiecePosition { piece: &self.tree[node].piece, offset_in_piece: offset_in_node })
         } else {
             None
         }
@@ -267,56 +281,60 @@ impl<T: RopePiece> Rope<T> {
     /// guaranteed to be consistent and can be at the tail position of
     /// any node as long as their tail position matches. The caller is
     /// responsible for adjusting the position if they want to.
-    pub(crate) fn node_at(&self, offset: usize) -> Option<NodePosition> {
+    pub(crate) fn node_at(&self, offset: usize) -> Option<CursorPos<T>> {
         self.node_at_metric::<BaseMetric>(offset)
     }
 
-    pub(crate) fn node_at_metric<M: Metric<T>>(&self, offset: usize) -> Option<NodePosition> {
-        let mut x = self.tree.root;
+    pub(crate) fn node_at_metric<M: Metric<T>>(&self, offset: usize) -> Option<CursorPos<T>> {
+        Self::tree_node_at_metric::<M>(&self.tree, offset)
+    }
+    fn tree_node_at_metric<M: Metric<T>>(tree: &RbSlab<T>, offset: usize) -> Option<CursorPos<T>> {
+        let x = tree.root;
         if offset == 0 {
-            if self.tree.root.is_sentinel() {
-                return None;
-            }
-            x = self.tree.edge(x, LEFT);
-            Some(NodePosition { node: x, in_node_offset: 0 })
+            let Some(mut x) = x else { return None; };
+            x = tree.edge(x, LEFT);
+            Some(CursorPos::new(x, 0))
         } else {
-            rel_node_at_metric::<T, M>(&self.tree, x, offset)
+            rel_node_at_metric::<T, M>(tree, x, offset)
         }
     }
 
     /// Get a cursor into the specified offset with metric `M`
-    pub fn cursor<M: Metric<T>>(&self, offset: usize) -> Cursor<T, M> {
-        let pos = self.node_at_metric::<M>(offset);
-        Cursor::<T, M>::new(&self.tree, pos.unwrap())
+    pub fn cursor<M: Metric<T>>(&self, offset: usize) -> Option<Cursor<'_, T>> {
+        Self::tree_cursor::<M>(&self.tree, self, offset)
+    }
+    /// Get a cursor like [Self::cursor] without borrowing the whole struct
+    fn tree_cursor<'a, M: Metric<T>>(tree: &'a RbSlab<T>, this: &Self, offset: usize) -> Option<Cursor<'a, T>> {
+        let pos = this.node_at_metric::<M>(offset);
+        pos.map(|c| c.cursor(tree))
     }
 
-    fn rb_insert(&mut self, node: Option<Ref>, piece: T, dir: usize) -> Ref {
+    fn rb_insert(&mut self, node: Ref, piece: T, dir: usize) -> SafeRef {
         let z = self.tree.insert(Node::new(piece));
         match node {
             None => {
-                debug_assert!(self.tree.root.is_sentinel());
-                self.tree.root = z;
-                self.tree[z].red = false;
+                debug_assert!(self.tree.root.is_none());
+                self.tree.root = Some(z);
+                self.tree[z].rb.red = false;
             }
             Some(node) => {
-                debug_assert!(!node.is_sentinel());
                 let n = &mut self.tree[node];
-                let n_child = n.children[dir];
-                if n_child.is_sentinel() {
-                    n.children[dir] = z;
-                    self.tree[z].parent = node;
-                } else {
+                let n_child = n.rb.children[dir];
+                if let Some(n_child) = n_child {
                     let prev = self.tree.edge(n_child, dir ^ 1);
-                    self.tree[prev].children[dir ^ 1] = z;
-                    self.tree[z].parent = prev;
+                    self.tree[prev].rb.children[dir ^ 1] = Some(z);
+                    self.tree[z].rb.parent = Some(prev);
+                } else {
+                    n.rb.children[dir] = Some(z);
+                    self.tree[z].rb.parent = Some(node);
                 }
             }
         }
-        self.tree.fix_insert(z);
+        self.tree.fix_insert(Some(z));
         z
     }
 
-    fn delete_nodes(&mut self, nodes: Vec<Ref>) {
+    fn delete_nodes(&mut self, nodes: Vec<SafeRef>) {
         for node in nodes {
             self.tree.delete(node);
         }
@@ -333,77 +351,14 @@ impl<T: RopePiece> Rope<T> {
     }
 }
 
-pub(crate) fn rel_node_at_metric<T: Summable, M: Metric<T>>(
-    tree: &RbSlab<T>, mut x: Ref, mut offset: usize,
-) -> Option<NodePosition> {
-    while !x.is_sentinel() {
-        let n = &tree[x];
-        let left_len = M::measure(&n.left_sum);
-        if left_len >= offset {
-            x = n.children[0];
-        } else {
-            let n_len = M::measure(&n.piece.summarize());
-            let pre_len = left_len + n_len;
-            if pre_len >= offset {
-                offset -= left_len;
-                debug_assert!((offset == 0) == (n_len == 0));
-                return Some(NodePosition {
-                    node: x,
-                    in_node_offset: offset,
-                });
-            } else {
-                offset -= pre_len;
-                x = n.children[1];
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
-    tree: &RbSlab<T>, from: NodePosition, offset: usize, dir: usize,
-) -> Option<NodePosition> {
-    let mut x = from.node;
-    if dir == LEFT && offset <= from.in_node_offset {
-        return Some(NodePosition { node: x, in_node_offset: from.in_node_offset - offset });
-    }
-    let n = &tree[x];
-    let len = n.piece.summarize();
-    let remaining = M::measure(&len) - from.in_node_offset - 1;
-    if dir == RIGHT && offset <= remaining {
-        return Some(NodePosition { node: x, in_node_offset: from.in_node_offset + offset });
-    }
-
-    let mut offset_i = M::measure(&n.left_sum) as isize
-        + from.in_node_offset as isize
-        + if dir == LEFT { -(offset as isize) } else { offset as isize };
-    while !x.is_sentinel() {
-        let n = &tree[x];
-        if 0 <= offset_i {
-            let subtree = rel_node_at_metric::<T, M>(tree, x, offset_i as usize);
-            if subtree.is_some() {
-                return subtree;
-            }
-        }
-
-        let p = n.parent;
-        let pn = &tree[p];
-        if pn.children[1] == x {
-            offset_i += M::measure(&pn.left_sum) as isize;
-            offset_i += M::measure(&pn.piece.summarize()) as isize;
-        }
-        x = p;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+    use super::*;
+    use crate::piece::{RopeContext, Summable};
+    use crate::rb_base::SENTINEL;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use crate::piece::Summable;
-    use crate::rb_base::SENTINEL;
-    use super::*;
 
     impl Sum for usize {
         fn len(&self) -> usize {
@@ -424,6 +379,8 @@ mod tests {
         fn summarize(&self) -> Self::S {
             self.len()
         }
+    }
+    impl RopeContext<String> for () {
     }
     impl RopePiece for String {
         type Context = ();
@@ -543,25 +500,25 @@ mod tests {
     fn substring(rope: &Rope<String>, start: usize, end: usize) -> String {
         let start = rope.node_at(start).unwrap();
         let end = rope.node_at(end).unwrap();
-        let mut i = start.node;
+        let mut i = Some(start.node);
         let mut s = String::default();
-        while !i.is_sentinel() {
-            let offset = if i == start.node {
-                start.in_node_offset
+        while let Some(idx) = i {
+            let offset = if idx == start.node {
+                start.offset_in_node
             } else {
                 0
             };
-            let piece = &rope.tree[i].piece;
-            let end_off = if i == end.node {
-                end.in_node_offset
+            let piece = &rope.tree[idx].piece;
+            let end_off = if idx == end.node {
+                end.offset_in_node
             } else {
                 piece.len()
             };
             s.push_str(&piece[offset..end_off]);
-            if i == end.node {
+            if idx == end.node {
                 break;
             }
-            i = rope.tree.next(i, RIGHT);
+            i = rope.tree.next(idx, RIGHT);
         }
         s
     }
@@ -588,30 +545,30 @@ mod tests {
 
         let rb = &r.tree;
         assert_eq!(rb.slab[1].piece, "xxxx");
-        assert_eq!(rb.slab[1].parent, SENTINEL);
-        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].children[1], Ref(3)); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab[1].rb.parent, SENTINEL);
+        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
 
         assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[2].parent, Ref(1));
-        assert_eq!(rb.slab[2].children[0], SENTINEL);
-        assert_eq!(rb.slab[2].children[1], SENTINEL);
+        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab[2].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[2].rb.children[1], SENTINEL);
 
         assert_eq!(rb.slab[3].piece, "y");
-        assert_eq!(rb.slab[3].parent, Ref(1));
-        assert_eq!(rb.slab[3].children[0], Ref(4)); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab[3].rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
 
         assert_eq!(rb.slab[4].piece, "bb");
-        assert_eq!(rb.slab[4].parent, Ref(3));
-        assert_eq!(rb.slab[4].children[0], SENTINEL);
-        assert_eq!(rb.slab[4].children[1], SENTINEL);
+        assert_eq!(rb.slab[4].rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab[4].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[4].rb.children[1], SENTINEL);
         assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].parent, Ref(3));
-        assert_eq!(rb.slab[5].children[0], SENTINEL);
-        assert_eq!(rb.slab[5].children[1], SENTINEL);
+        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab[5].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[5].rb.children[1], SENTINEL);
 
-        r.tree.rotate(Ref(1), 0); // left-rotate x
+        r.tree.rotate(NonZero::new(1), 0); // left-rotate x
         assert_eq!("axxxxbbyg", gather(&r));
         let rb = &r.tree;
 
@@ -627,43 +584,43 @@ mod tests {
 
         assert_eq!(rb.slab[1].piece, "xxxx");
         assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[1].parent, Ref(3)); // x's new parent is y
-        assert_eq!(rb.slab[3].children[0], Ref(1)); // y's left child is x
-        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right child is gamma
+        assert_eq!(rb.slab[1].rb.parent, NonZero::new(3)); // x's new parent is y
+        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(1)); // y's left child is x
+        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right child is gamma
         assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].parent, Ref(3));
-        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left child is alpha
-        assert_eq!(rb.slab[1].children[1], Ref(4)); // x's right child is beta
-        assert_eq!(rb.slab[2].parent, Ref(1)); // alpha's parent is x
-        assert_eq!(rb.slab[4].parent, Ref(1)); // beta's parent is x
+        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left child is alpha
+        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(4)); // x's right child is beta
+        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1)); // alpha's parent is x
+        assert_eq!(rb.slab[4].rb.parent, NonZero::new(1)); // beta's parent is x
 
-        r.tree.rotate(Ref(3), 1); // right-rotate y brings our tree back to the original
+        r.tree.rotate(NonZero::new(3), 1); // right-rotate y brings our tree back to the original
         assert_eq!("axxxxbbyg", gather(&r));
         let rb = &r.tree;
 
         assert_eq!(rb.slab[1].piece, "xxxx");
-        assert_eq!(rb.slab[1].parent, SENTINEL);
-        assert_eq!(rb.slab[1].children[0], Ref(2)); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].children[1], Ref(3)); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab[1].rb.parent, SENTINEL);
+        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
 
         assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[2].parent, Ref(1));
-        assert_eq!(rb.slab[2].children[0], SENTINEL);
-        assert_eq!(rb.slab[2].children[1], SENTINEL);
+        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab[2].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[2].rb.children[1], SENTINEL);
 
         assert_eq!(rb.slab[3].piece, "y");
-        assert_eq!(rb.slab[3].parent, Ref(1));
-        assert_eq!(rb.slab[3].children[0], Ref(4)); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].children[1], Ref(5)); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab[3].rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
 
         assert_eq!(rb.slab[4].piece, "bb");
-        assert_eq!(rb.slab[4].parent, Ref(3));
-        assert_eq!(rb.slab[4].children[0], SENTINEL);
-        assert_eq!(rb.slab[4].children[1], SENTINEL);
+        assert_eq!(rb.slab[4].rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab[4].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[4].rb.children[1], SENTINEL);
         assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].parent, Ref(3));
-        assert_eq!(rb.slab[5].children[0], SENTINEL);
-        assert_eq!(rb.slab[5].children[1], SENTINEL);
+        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab[5].rb.children[0], SENTINEL);
+        assert_eq!(rb.slab[5].rb.children[1], SENTINEL);
     }
 
     #[test]

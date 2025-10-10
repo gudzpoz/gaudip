@@ -1,4 +1,4 @@
-use crate::rb_base::Ref;
+use crate::rb_base::SafeRef;
 
 /// Summary for a [Summable]
 ///
@@ -131,12 +131,12 @@ pub trait RopePiece: Summable + Sized {
 /// in [RopeContext::on_insertion] and delete them when [RopeContext::on_deletion]
 /// is called.
 #[derive(Clone)]
-pub struct TransientRef(Ref);
+pub struct TransientRef(pub(crate) SafeRef);
 
 #[allow(clippy::from_over_into)]
 impl Into<usize> for TransientRef {
     fn into(self) -> usize {
-        self.0.0
+        self.0.get()
     }
 }
 
