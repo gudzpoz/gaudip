@@ -79,7 +79,7 @@ pub trait RopePiece: Summable + Sized {
     /// the same context object, as is returned by [crate::roperig::Rope::context].
     ///
     /// [piece tree]: https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
-    type Context: RopeContext<Self>;
+    type Context;
 
     /// Precondition to [Self::insert_or_split] when deleting nodes
     /// 
@@ -137,21 +137,5 @@ pub struct TransientRef(pub(crate) SafeRef);
 impl Into<usize> for TransientRef {
     fn into(self) -> usize {
         self.0.get()
-    }
-}
-
-/// Context object for a rope
-///
-/// Usually used by ropes to store external data, if any.
-///
-/// The main purpose of the [RopeContext::on_insertion] and
-/// [RopeContext::on_deletion] APIs is to allow safe references to
-/// certain nodes in the tree. This might be useful to markers.
-pub trait RopeContext<R: RopePiece>: Default {
-    /// Called when a new node is inserted into the tree
-    fn on_insertion(&mut self, _piece: &mut R, _node: TransientRef) {
-    }
-    /// Called when a node is deleted from the tree
-    fn on_deletion(&mut self, _piece: R, _node: TransientRef) {
     }
 }

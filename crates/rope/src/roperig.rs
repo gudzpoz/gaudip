@@ -53,7 +53,7 @@ pub struct Rope<T: RopePiece> {
     sum: T::S,
     context: T::Context,
 }
-impl<T: RopePiece> Default for Rope<T> {
+impl<T: RopePiece> Default for Rope<T> where T::Context: Default {
     fn default() -> Self {
         Self::new(Default::default())
     }
@@ -86,7 +86,7 @@ impl<T: RopePiece> Rope<T> {
     
     /// Check if the rope contains nothing
     pub fn is_empty(&self) -> bool {
-        self.tree.root.is_none()
+        self.tree.root().is_none()
     }
     
     /// Returns the length of the rope
@@ -289,9 +289,9 @@ impl<T: RopePiece> Rope<T> {
         Self::tree_node_at_metric::<M>(&self.tree, offset)
     }
     fn tree_node_at_metric<M: Metric<T>>(tree: &RbSlab<T>, offset: usize) -> Option<CursorPos<T>> {
-        let x = tree.root;
+        let x = tree.root();
         if offset == 0 {
-            let Some(mut x) = x else { return None; };
+            let mut x = x?;
             x = tree.edge(x, LEFT);
             Some(CursorPos::new(x, 0))
         } else {
@@ -313,8 +313,8 @@ impl<T: RopePiece> Rope<T> {
         let z = self.tree.insert(Node::new(piece));
         match node {
             None => {
-                debug_assert!(self.tree.root.is_none());
-                self.tree.root = Some(z);
+                debug_assert!(self.is_empty());
+                self.tree.set_root(Some(z));
                 self.tree[z].rb.red = false;
             }
             Some(node) => {
@@ -341,7 +341,7 @@ impl<T: RopePiece> Rope<T> {
     }
 
     fn recompute_metadata(&mut self) {
-        self.sum = self.tree.calculate_sum(self.tree.root);
+        self.sum = self.tree.calculate_sum(self.tree.root());
     }
     
     #[cfg(test)]
@@ -355,10 +355,11 @@ impl<T: RopePiece> Rope<T> {
 mod tests {
     use std::num::NonZero;
     use super::*;
-    use crate::piece::{RopeContext, Summable};
+    use crate::piece::Summable;
     use crate::rb_base::SENTINEL;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+    use crate::metrics::tests::validate_with_cursor;
 
     impl Sum for usize {
         fn len(&self) -> usize {
@@ -379,8 +380,6 @@ mod tests {
         fn summarize(&self) -> Self::S {
             self.len()
         }
-    }
-    impl RopeContext<String> for () {
     }
     impl RopePiece for String {
         type Context = ();
@@ -429,11 +428,11 @@ mod tests {
     fn test_insert() {
         let mut rope: Rope<String> = Rope::default();
         rope.insert(0, "aaa".to_string());
-        assert_eq!("aaa", rope.tree.slab[1].piece);
+        assert_eq!("aaa", rope.tree.slab(1).piece);
         rope.insert(1, "bbb".to_string());
-        assert_eq!("a", rope.tree.slab[1].piece);
-        assert_eq!("bbb", rope.tree.slab[2].piece);
-        assert_eq!("aa", rope.tree.slab[3].piece);
+        assert_eq!("a", rope.tree.slab(1).piece);
+        assert_eq!("bbb", rope.tree.slab(2).piece);
+        assert_eq!("aa", rope.tree.slab(3).piece);
     }
 
     #[test]
@@ -447,10 +446,10 @@ mod tests {
             for (i, node) in result.iter().enumerate() {
                 assert_eq!(
                     node,
-                    &rope.tree.slab.get(i + 1).map(|n| n.piece.as_str()),
+                    &rope.tree.slab_get(i + 1).map(|n| n.piece.as_str()),
                 );
             }
-            assert!(rope.tree.slab.len() <= result.len() + 1);
+            assert!(rope.tree.slab_len() <= result.len() + 1);
         }
         // insert merge
         assert_merge(
@@ -492,6 +491,7 @@ mod tests {
         assert_pos(rb.search(7), "3", 1);
 
         rb.is_valid(); // will panic if it must
+        validate_with_cursor(&rb);
     }
 
     fn gather(rope: &Rope<String>) -> String {
@@ -544,29 +544,29 @@ mod tests {
         assert_eq!("axxxxbbyg", gather(&r));
 
         let rb = &r.tree;
-        assert_eq!(rb.slab[1].piece, "xxxx");
-        assert_eq!(rb.slab[1].rb.parent, SENTINEL);
-        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab(1).piece, "xxxx");
+        assert_eq!(rb.slab(1).rb.parent, SENTINEL);
+        assert_eq!(rb.slab(1).rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab(1).rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
 
-        assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1));
-        assert_eq!(rb.slab[2].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[2].rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(2).piece, "a");
+        assert_eq!(rb.slab(2).rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab(2).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(2).rb.children[1], SENTINEL);
 
-        assert_eq!(rb.slab[3].piece, "y");
-        assert_eq!(rb.slab[3].rb.parent, NonZero::new(1));
-        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab(3).piece, "y");
+        assert_eq!(rb.slab(3).rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab(3).rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab(3).rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
 
-        assert_eq!(rb.slab[4].piece, "bb");
-        assert_eq!(rb.slab[4].rb.parent, NonZero::new(3));
-        assert_eq!(rb.slab[4].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[4].rb.children[1], SENTINEL);
-        assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
-        assert_eq!(rb.slab[5].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[5].rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(4).piece, "bb");
+        assert_eq!(rb.slab(4).rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab(4).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(4).rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(5).piece, "g");
+        assert_eq!(rb.slab(5).rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab(5).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(5).rb.children[1], SENTINEL);
 
         r.tree.rotate(NonZero::new(1), 0); // left-rotate x
         assert_eq!("axxxxbbyg", gather(&r));
@@ -582,45 +582,45 @@ mod tests {
 
         // slab entries should be the same, but their links should reflect the new tree topology
 
-        assert_eq!(rb.slab[1].piece, "xxxx");
-        assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[1].rb.parent, NonZero::new(3)); // x's new parent is y
-        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(1)); // y's left child is x
-        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right child is gamma
-        assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
-        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left child is alpha
-        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(4)); // x's right child is beta
-        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1)); // alpha's parent is x
-        assert_eq!(rb.slab[4].rb.parent, NonZero::new(1)); // beta's parent is x
+        assert_eq!(rb.slab(1).piece, "xxxx");
+        assert_eq!(rb.slab(2).piece, "a");
+        assert_eq!(rb.slab(1).rb.parent, NonZero::new(3)); // x's new parent is y
+        assert_eq!(rb.slab(3).rb.children[0], NonZero::new(1)); // y's left child is x
+        assert_eq!(rb.slab(3).rb.children[1], NonZero::new(5)); // y's right child is gamma
+        assert_eq!(rb.slab(5).piece, "g");
+        assert_eq!(rb.slab(5).rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab(1).rb.children[0], NonZero::new(2)); // x's left child is alpha
+        assert_eq!(rb.slab(1).rb.children[1], NonZero::new(4)); // x's right child is beta
+        assert_eq!(rb.slab(2).rb.parent, NonZero::new(1)); // alpha's parent is x
+        assert_eq!(rb.slab(4).rb.parent, NonZero::new(1)); // beta's parent is x
 
         r.tree.rotate(NonZero::new(3), 1); // right-rotate y brings our tree back to the original
         assert_eq!("axxxxbbyg", gather(&r));
         let rb = &r.tree;
 
-        assert_eq!(rb.slab[1].piece, "xxxx");
-        assert_eq!(rb.slab[1].rb.parent, SENTINEL);
-        assert_eq!(rb.slab[1].rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
-        assert_eq!(rb.slab[1].rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
+        assert_eq!(rb.slab(1).piece, "xxxx");
+        assert_eq!(rb.slab(1).rb.parent, SENTINEL);
+        assert_eq!(rb.slab(1).rb.children[0], NonZero::new(2)); // x's left points to 2 in the slab i.e. alpha
+        assert_eq!(rb.slab(1).rb.children[1], NonZero::new(3)); // x's right points to 3 in the slab i.e. y
 
-        assert_eq!(rb.slab[2].piece, "a");
-        assert_eq!(rb.slab[2].rb.parent, NonZero::new(1));
-        assert_eq!(rb.slab[2].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[2].rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(2).piece, "a");
+        assert_eq!(rb.slab(2).rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab(2).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(2).rb.children[1], SENTINEL);
 
-        assert_eq!(rb.slab[3].piece, "y");
-        assert_eq!(rb.slab[3].rb.parent, NonZero::new(1));
-        assert_eq!(rb.slab[3].rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
-        assert_eq!(rb.slab[3].rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
+        assert_eq!(rb.slab(3).piece, "y");
+        assert_eq!(rb.slab(3).rb.parent, NonZero::new(1));
+        assert_eq!(rb.slab(3).rb.children[0], NonZero::new(4)); // y's left points to 4 in the slab i.e. beta
+        assert_eq!(rb.slab(3).rb.children[1], NonZero::new(5)); // y's right points to 5 in the slab i.e. gamma
 
-        assert_eq!(rb.slab[4].piece, "bb");
-        assert_eq!(rb.slab[4].rb.parent, NonZero::new(3));
-        assert_eq!(rb.slab[4].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[4].rb.children[1], SENTINEL);
-        assert_eq!(rb.slab[5].piece, "g");
-        assert_eq!(rb.slab[5].rb.parent, NonZero::new(3));
-        assert_eq!(rb.slab[5].rb.children[0], SENTINEL);
-        assert_eq!(rb.slab[5].rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(4).piece, "bb");
+        assert_eq!(rb.slab(4).rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab(4).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(4).rb.children[1], SENTINEL);
+        assert_eq!(rb.slab(5).piece, "g");
+        assert_eq!(rb.slab(5).rb.parent, NonZero::new(3));
+        assert_eq!(rb.slab(5).rb.children[0], SENTINEL);
+        assert_eq!(rb.slab(5).rb.children[1], SENTINEL);
     }
 
     #[test]
@@ -642,6 +642,7 @@ mod tests {
             }
             assert_eq!(expected[start..end], substring(&rb, start, end));
             assert_eq!(expected.len(), rb.sum.len());
+            validate_with_cursor(&rb);
         }
 
         rb.is_valid(); // will panic if it must
@@ -664,6 +665,7 @@ mod tests {
             assert_eq!(500000 / 26 * 26 * 2 - deleted, rb.sum.len());
             let char = ((at + deleted) % 26) as u8 + b'a';
             assert_pos(rb.search(at + 1), str::from_utf8(&[char]).unwrap(), 1);
+            validate_with_cursor(rb);
         }
         fn assert_alphabet(rb: &Rope<String>, at: usize) {
             assert_alpha_off(rb, at, 0);

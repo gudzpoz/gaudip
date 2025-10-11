@@ -62,7 +62,7 @@ impl<T: Summable> Metric<T> for BaseMetric {
 /// A more verbose API for cursor navigation and modification
 ///
 /// The user is responsible for ensuring to pass the correct
-/// [Rope] reference to the member functions.
+/// [crate::roperig::Rope] reference to the member functions.
 pub struct CursorPos<T: Summable> {
     /// Reference to an actual node
     pub(crate) node: SafeRef,
@@ -271,7 +271,7 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
         }
 
         let p = n.rb.parent;
-        let pn = &tree.rb(p);
+        let pn = &tree[p];
         if pn.children[1] == x {
             let Some(p) = p else { unreachable!() };
             offset_i += M::measure(&tree[p].left_sum) as isize;
@@ -280,4 +280,32 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
         x = p;
     }
     None
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::roperig::Rope;
+    use super::*;
+
+    pub fn validate_with_cursor(rb: &Rope<String>) {
+        let Some(mut cursor) = rb.cursor::<BaseMetric>(0) else {
+            assert_eq!(rb.len(), 0);
+            assert!(rb.is_empty());
+            return;
+        };
+        let mut c: Option<char> = None;
+        loop {
+            let (s, offset) = cursor.get_base_units();
+            assert_eq!(offset, 0);
+            assert!(!s.is_empty());
+            let next = s.chars().next().unwrap();
+            if let Some(c) = c {
+                assert_ne!(next, c);
+            }
+            c = s.chars().next();
+            if !cursor.next_piece() {
+                break;
+            }
+        }
+    }
 }

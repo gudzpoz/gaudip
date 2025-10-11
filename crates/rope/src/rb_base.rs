@@ -43,24 +43,36 @@
 
 use crate::piece::{Sum, Summable};
 use slab::Slab;
-use std::mem;
+use std::mem::MaybeUninit;
+use std::num::NonZero;
 use std::ops::{Index, IndexMut};
 
+/// Safe references for [Node], guaranteeing non-sentinel nodes
+///
 /// See [Node].
 pub(crate) type SafeRef = NonZero<usize>;
 /// A wrapper around indices returned by [Slab]
 ///
-/// See [Node].
-// We can potentially change from `usize` to smaller integers
-// because it will be used for visible line tracking, which
-// rarely exceeds even `u8::MAX`. This type wrapper might help
-// if we are to make such a change.
+/// It's typically unsafe, because it might point to [SENTINEL] nodes,
+/// whose [Node::piece] is uninitialized. See [Node].
 pub(crate) type Ref = Option<SafeRef>;
 pub const SENTINEL: Ref = None;
+fn ref_int(node: Ref) -> usize {
+    node.map(|r| r.get()).unwrap_or(0)
+}
 
 pub(crate) struct RbSlab<T: Summable> {
-    pub slab: Slab<Node<T>>,
-    pub root: Ref,
+    /// Slab storage for nodes
+    ///
+    /// The first element (referenced by [SENTINEL]) is zero-initialized
+    /// and is unsafe to access (unless accessing only the [RbNode] part).
+    ///
+    /// Please do not access this field directly, but instead add accessor
+    /// methods that build on the safety assumptions:
+    /// - [SafeRef] for [Node] access,
+    /// - [Ref] (for [RbNode] access).
+    slab: Slab<Node<T>>,
+    root: Ref,
 }
 impl<T: Summable> RbSlab<T> {
     pub fn new() -> Self {
@@ -72,11 +84,18 @@ impl<T: Summable> RbSlab<T> {
                 red: false,
             },
             left_sum: T::S::identity(),
-            piece: unsafe { mem::MaybeUninit::zeroed().assume_init() },
+            piece: unsafe { MaybeUninit::zeroed().assume_init() },
         });
         assert_eq!(index, 0);
         Self { slab, root: SENTINEL }
     }
+    pub fn root(&self) -> Ref {
+        self.root
+    }
+    pub fn set_root(&mut self, root: Ref) {
+        self.root = root;
+    }
+
     pub fn insert(&mut self, node: Node<T>) -> SafeRef {
         NonZero::new(self.slab.insert(node)).unwrap()
     }
@@ -84,17 +103,11 @@ impl<T: Summable> RbSlab<T> {
         self.slab.remove(idx.get()).piece
     }
 
-    fn get2(&mut self, idx1: Ref, idx2: Ref) -> (&mut RbNode, &mut RbNode) {
-        let idx1 = idx1.map(|r| r.get()).unwrap_or(0);
-        let idx2 = idx2.map(|r| r.get()).unwrap_or(0);
+    fn get2(&mut self, idx1: SafeRef, idx2: SafeRef) -> (&mut RbNode, &mut RbNode) {
+        let idx1 = idx1.get();
+        let idx2 = idx2.get();
         let (n1, n2) = self.slab.get2_mut(idx1, idx2).unwrap();
         (&mut n1.rb, &mut n2.rb)
-    }
-    pub(crate) fn rb(&self, node: Ref) -> &RbNode {
-        &self.slab[node.map(|r| r.get()).unwrap_or(0)].rb
-    }
-    pub(crate) fn rb_mut(&mut self, node: Ref) -> &mut RbNode {
-        &mut self.slab[node.map(|r| r.get()).unwrap_or(0)].rb
     }
 }
 pub const LEFT: usize = 0;
@@ -148,6 +161,19 @@ impl<T: Summable> IndexMut<SafeRef> for RbSlab<T> {
         &mut self.slab[index.get()]
     }
 }
+impl<T: Summable> Index<Ref> for RbSlab<T> {
+    type Output = RbNode;
+
+    fn index(&self, index: Ref) -> &Self::Output {
+        &self.slab[ref_int(index)].rb
+    }
+}
+impl<T: Summable> IndexMut<Ref> for RbSlab<T> {
+    fn index_mut(&mut self, index: Ref) -> &mut Self::Output {
+        &mut self.slab[ref_int(index)].rb
+    }
+}
+
 impl<T: Summable> RbSlab<T> {
     pub fn next(&self, mut this: SafeRef, dir: usize) -> Ref {
         let child = self[this].rb.children[dir];
@@ -183,13 +209,13 @@ impl<T: Summable> RbSlab<T> {
     }
 
     fn reset_sentinel(&mut self) {
-        self.rb_mut(SENTINEL).parent = SENTINEL;
+        self[SENTINEL].parent = SENTINEL;
     }
 
     pub fn rotate(&mut self, x: Ref, dir: usize) {
         debug_assert!(dir == 0 || dir == 1);
         let dir = dir & 1;
-        let y = self.rb(x).children[dir ^ 1];
+        let y = self[x].children[dir ^ 1];
 
         // fix stats
         let (left, right) = if dir == 0 { (x, y) } else { (y, x) };
@@ -206,23 +232,23 @@ impl<T: Summable> RbSlab<T> {
             }
         }
 
-        self.rb_mut(x).children[dir ^ 1] = self.rb_mut(y).children[dir];
-        let y_child = self.rb(y).children[dir];
+        self[x].children[dir ^ 1] = self[y].children[dir];
+        let y_child = self[y].children[dir];
         if let Some(idx) = y_child {
             self[idx].rb.parent = x;
         }
         self.replace(x, y);
-        self.rb_mut(y).children[dir] = x;
-        self.rb_mut(x).parent = y;
+        self[y].children[dir] = x;
+        self[x].parent = y;
     }
 
     fn replace(&mut self, x: Ref, y: Ref) {
-        let parent = self.rb(x).parent;
-        self.rb_mut(y).parent = parent;
+        let parent = self[x].parent;
+        self[y].parent = parent;
         if parent.is_none() {
             self.root = y;
         } else {
-            let parent = &mut self.rb_mut(parent);
+            let parent = &mut self[parent];
             let dir = if parent.children[0] == x { 0 } else { 1 };
             parent.children[dir] = y;
         }
@@ -243,7 +269,7 @@ impl<T: Summable> RbSlab<T> {
 
         if Some(y) == self.root {
             self.root = x;
-            let xn = &mut self.rb_mut(x);
+            let xn = &mut self[x];
             xn.red = false;
             xn.parent = SENTINEL;
             self.reset_sentinel();
@@ -254,21 +280,21 @@ impl<T: Summable> RbSlab<T> {
         let y_red = yn.red;
         let y_parent = yn.parent;
 
-        let y_parent_i = if Some(y) == self.rb(y_parent).children[0] {
+        let y_parent_i = if Some(y) == self[y_parent].children[0] {
             0
         } else {
             1
         };
-        self.rb_mut(y_parent).children[y_parent_i] = x;
+        self[y_parent].children[y_parent_i] = x;
 
         if y == z {
-            self.rb_mut(x).parent = y_parent;
+            self[x].parent = y_parent;
             self.recompute_sum(x);
         } else {
-            self.rb_mut(x).parent = if Some(z) == self[y].rb.parent { Some(y) } else { y_parent };
+            self[x].parent = if Some(z) == self[y].rb.parent { Some(y) } else { y_parent };
             self.recompute_sum(x);
 
-            let (yn, zn) = self.get2(Some(y), Some(z));
+            let (yn, zn) = self.get2(y, z);
             yn.children = zn.children;
             yn.parent = zn.parent;
             yn.red = zn.red;
@@ -280,7 +306,7 @@ impl<T: Summable> RbSlab<T> {
                 self.root = y;
             } else {
                 let parent = self[z].rb.parent;
-                let zp = &mut self.rb_mut(parent);
+                let zp = &mut self[parent];
                 let dir = if Some(z) == zp.children[0] { 0 } else { 1 };
                 zp.children[dir] = y;
             }
@@ -295,8 +321,8 @@ impl<T: Summable> RbSlab<T> {
         }
         let ret = self.remove(z);
 
-        let xp = self.rb(x).parent;
-        let xpn = &self.rb(xp);
+        let xp = self[x].parent;
+        let xpn = &self[xp];
         if xpn.children[0] == x {
             let Some(xp) = xp else { unreachable!(); };
             let xpn = &self[xp];
@@ -319,89 +345,89 @@ impl<T: Summable> RbSlab<T> {
     }
 
     fn rb_insert_fixup(&mut self, mut x: Ref) {
-        while x != self.root && !self.rb(x).red {
-            let p = self.rb(x).parent;
-            let dir = if x == self.rb(p).children[0] { 1 } else { 0 };
-            let mut w = self.rb(p).children[dir];
-            if self.rb(w).red {
-                self.rb_mut(w).red = false;
-                self.rb_mut(p).red = true;
+        while x != self.root && !self[x].red {
+            let p = self[x].parent;
+            let dir = if x == self[p].children[0] { 1 } else { 0 };
+            let mut w = self[p].children[dir];
+            if self[w].red {
+                self[w].red = false;
+                self[p].red = true;
                 self.rotate(p, dir ^ 1);
 
                 // recompute w after the rotation of p
-                w = self.rb(p).children[dir];
+                w = self[p].children[dir];
             }
-            let wl = self.rb(w).children[0];
-            let wr = self.rb(w).children[1];
-            if !self.rb(wl).red && !self.rb(wr).red {
-                self.rb_mut(w).red = true;
+            let wl = self[w].children[0];
+            let wr = self[w].children[1];
+            if !self[wl].red && !self[wr].red {
+                self[w].red = true;
                 x = p;
             } else {
-                let mut wc = self.rb(w).children[dir]; // w child i care about
-                let wo = self.rb(w).children[dir ^ 1]; // w other child
-                if !self.rb(wc).red {
-                    self.rb_mut(wo).red = false;
-                    self.rb_mut(w).red = true;
+                let mut wc = self[w].children[dir]; // w child i care about
+                let wo = self[w].children[dir ^ 1]; // w other child
+                if !self[wc].red {
+                    self[wo].red = false;
+                    self[w].red = true;
                     self.rotate(w, dir);
-                    w = self.rb(p).children[dir];
+                    w = self[p].children[dir];
 
                     // recompute wc after the rotation of w
-                    wc = self.rb(w).children[dir];
+                    wc = self[w].children[dir];
                 }
-                self.rb_mut(w).red = self.rb(p).red;
-                self.rb_mut(p).red = false;
-                self.rb_mut(wc).red = false;
+                self[w].red = self[p].red;
+                self[p].red = false;
+                self[wc].red = false;
                 self.rotate(p, dir ^ 1);
                 x = self.root
             }
         }
 
         // blacken x
-        self.rb_mut(x).red = false;
+        self[x].red = false;
         self.reset_sentinel();
     }
 
     pub fn fix_insert(&mut self, mut z: Ref) {
         self.recompute_sum(z);
 
-        let mut p = self.rb(z).parent;
+        let mut p = self[z].parent;
 
-        while z != self.root && self.rb(p).red {
-            p = self.rb(z).parent;
-            let mut pp = self.rb(p).parent;
+        while z != self.root && self[p].red {
+            p = self[z].parent;
+            let mut pp = self[p].parent;
 
-            let dir = if self.rb(pp).children[0] == p { 1 } else { 0 };
+            let dir = if self[pp].children[0] == p { 1 } else { 0 };
 
-            let y = self.rb(pp).children[dir];
+            let y = self[pp].children[dir];
 
-            if self.rb(y).red {
-                self.rb_mut(p).red = false;
-                self.rb_mut(y).red = false;
-                self.rb_mut(pp).red = true;
+            if self[y].red {
+                self[p].red = false;
+                self[y].red = false;
+                self[pp].red = true;
                 z = pp;
 
                 // recompute parent and grandparent after changing z
-                p = self.rb(z).parent;
+                p = self[z].parent;
             } else {
                 // y is black, or nil sentinel
-                if z == self.rb(p).children[dir] {
+                if z == self[p].children[dir] {
                     z = p;
 
                     self.rotate(z, dir ^ 1);
 
                     // recompute parent and grandparent after rotation
-                    p = self.rb(z).parent;
-                    pp = self.rb(p).parent;
+                    p = self[z].parent;
+                    pp = self[p].parent;
                 }
-                self.rb_mut(p).red = false;
-                self.rb_mut(pp).red = true;
+                self[p].red = false;
+                self[pp].red = true;
                 self.rotate(pp, dir);
             }
         }
 
         // blacken the root
         let root = self.root;
-        self.rb_mut(root).red = false;
+        self[root].red = false;
     }
 
     fn recompute_sum(&mut self, x: Ref) {
@@ -415,7 +441,7 @@ impl<T: Summable> RbSlab<T> {
                 debug_assert!(Some(x) == self.root);
                 return;
             };
-            let node = &self.rb(parent);
+            let node = &self[parent];
             if Some(x) != node.children[1] {
                 x = pi;
                 break;
@@ -463,10 +489,22 @@ impl<T: Summable> RbSlab<T> {
 
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::num::NonZero;
 
 #[cfg(test)]
+/// The rb-tree implementation is actually split across two files:
+/// `rb_base.rs` and `roperig.rs`, with the majority of tests put
+/// in `roperig.rs`.
 impl<T: Summable> RbSlab<T> {
+    pub fn slab(&self, i: usize) -> &Node<T> {
+        &self.slab[i]
+    }
+    pub fn slab_get(&self, i: usize) -> Option<&Node<T>> {
+        self.slab.get(i)
+    }
+    pub fn slab_len(&self) -> usize {
+        self.slab.len()
+    }
+
     pub fn is_valid(&self) -> T::S {
         /*
          * properties
@@ -479,15 +517,15 @@ impl<T: Summable> RbSlab<T> {
             if x.is_none() {
                 return 0;
             }
-            let left_height = verify_black_height(rb, rb.rb(x).children[0]);
-            let right_height = verify_black_height(rb, rb.rb(x).children[1]);
+            let left_height = verify_black_height(rb, rb[x].children[0]);
+            let right_height = verify_black_height(rb, rb[x].children[1]);
 
             assert!(
                 left_height != -1 && right_height != -1 && left_height == right_height,
                 "red-black properties have been violated!"
             );
 
-            let add = if rb.rb(x).red { 0 } else { 1 };
+            let add = if rb[x].red { 0 } else { 1 };
             left_height + add
         }
 
@@ -509,7 +547,7 @@ impl<T: Summable> RbSlab<T> {
 
                 // red node must not have red children
                 if rb[idx].rb.red {
-                    assert!(!rb.rb(l).red && !rb.rb(r).red, "red node has red children");
+                    assert!(!rb[l].red && !rb[r].red, "red node has red children");
                 }
 
                 if l.is_some() {
@@ -537,9 +575,26 @@ impl<T: Summable> RbSlab<T> {
             sum
         }
 
-        assert!(!self.rb(self.root).red); // root is black
+        assert!(!self[self.root].red); // root is black
         verify_children_color(self);
         verify_black_height(self, self.root);
         verify_sums(self, self.root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::metrics::CursorPos;
+    use super::*;
+
+    #[test]
+    fn test_option_nonzero_sizes() {
+        assert_eq!(size_of::<Option<NonZero<usize>>>(), size_of::<NonZero<usize>>());
+        assert_eq!(size_of::<Ref>(), size_of::<SafeRef>());
+        assert_eq!(size_of::<Ref>(), size_of::<usize>());
+        // Option<CursorPos<T>> should be free because CursorPos contains SafeRef,
+        // which is NonZero, and can be used as Option-tagging.
+        type C = CursorPos<String>;
+        assert_eq!(size_of::<Option<C>>(), size_of::<C>());
     }
 }
