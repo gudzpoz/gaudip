@@ -174,6 +174,29 @@ impl<T: Summable> IndexMut<Ref> for RbSlab<T> {
     }
 }
 
+macro_rules! foreach_parent {
+    (({ $p:ident: $pn:ident } of { $x:ident: $n:ident } in $tree:expr) $what:block) => {{
+        let mut $x: SafeRef = $x;
+        loop {
+            let $n = &$tree[$x];
+            let parent = $n.rb.parent;
+            let Some($p) = parent else {
+                debug_assert!(Some($x) == $tree.root);
+                break None;
+            };
+            let $pn = &mut $tree[$p];
+            $what;
+            $x = $p;
+        }
+    }};
+    (({ $p:ident: $pn:ident } of $x:ident in $tree:expr) $what:block) => {
+        foreach_parent!(({ $p: $pn } of { $x: x_node } in $tree) $what)
+    };
+    (($pn:ident of $x:ident in $tree:expr) $what:block) => {
+        foreach_parent!(({ parent: $pn } of $x in $tree) $what)
+    };
+}
+
 impl<T: Summable> RbSlab<T> {
     pub fn next(&self, mut this: SafeRef, dir: usize) -> Ref {
         let child = self[this].rb.children[dir];
@@ -431,23 +454,13 @@ impl<T: Summable> RbSlab<T> {
     }
 
     fn recompute_sum(&mut self, x: Ref) {
-        let Some(mut x) = x else {
-            return;
-        };
-
-        loop {
-            let parent = self[x].rb.parent;
-            let Some(pi) = parent else {
-                debug_assert!(Some(x) == self.root);
-                return;
-            };
-            let node = &self[parent];
-            if Some(x) != node.children[1] {
-                x = pi;
-                break;
+        let Some(x) = x else { return };
+        let Some(x) = foreach_parent!(({ p: pn } of x in self) {
+            if Some(x) != pn.rb.children[1] {
+                x = p;
+                break Some(x);
             }
-            x = pi;
-        }
+        }) else { return };
 
         let xn = &self[x];
         let mut delta = self.calculate_sum(xn.rb.children[0]);
@@ -455,35 +468,16 @@ impl<T: Summable> RbSlab<T> {
 
         if delta != T::S::identity() {
             self[x].left_sum.add_assign(&delta);
-            loop {
-                let parent = self[x].rb.parent;
-                let Some(pi) = parent else {
-                    debug_assert!(Some(x) == self.root);
-                    break;
-                };
-                let node = &mut self[pi];
-                if node.rb.children[0] == Some(x) {
-                    node.left_sum.add_assign(&delta);
-                }
-
-                x = pi;
-            }
+            self.update_metadata(x, &delta);
         }
     }
 
-    pub fn update_metadata(&mut self, mut x: SafeRef, delta: &T::S) {
-        loop {
-            let xp = self[x].rb.parent;
-            let Some(parent) = xp else {
-                debug_assert!(Some(x) == self.root);
-                break;
-            };
-            let xpn = &mut self[parent];
-            if xpn.rb.children[0] == Some(x) {
-                xpn.left_sum.add_assign(delta);
+    pub fn update_metadata(&mut self, x: SafeRef, delta: &T::S) {
+        let _: Option<()> = foreach_parent!((pn of x in self) {
+            if pn.rb.children[0] == Some(x) {
+                pn.left_sum.add_assign(delta);
             }
-            x = parent;
-        }
+        });
     }
 }
 
