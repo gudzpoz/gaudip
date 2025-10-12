@@ -93,11 +93,7 @@ impl<T: Summable> CursorPos<T> {
         Cursor::new(tree, self)
     }
 
-    fn get<'a, M: Metric<T>>(&self, tree: &'a RbSlab<T>) -> (&'a T, usize) {
-        let piece = &tree[self.node].piece;
-        (piece, M::from_base_units(piece, self.offset_in_node))
-    }
-    fn get_base_units<'a>(&self, tree: &'a RbSlab<T>) -> (&'a T, usize) {
+    pub(crate) fn get_base_units<'a>(&self, tree: &'a RbSlab<T>) -> (&'a T, usize) {
         let piece = &tree[self.node].piece;
         (piece, self.offset_in_node)
     }
@@ -120,10 +116,10 @@ impl<T: Summable> CursorPos<T> {
         offset
     }
 
-    fn prev<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
+    pub(crate) fn prev<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
         self.move_towards::<M>(tree, measurement, LEFT)
     }
-    fn next<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
+    pub(crate) fn next<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
         self.move_towards::<M>(tree, measurement, RIGHT)
     }
     fn move_towards<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize, dir: usize) -> bool {
@@ -136,23 +132,27 @@ impl<T: Summable> CursorPos<T> {
         }
     }
 
-    fn next_piece(&mut self, tree: &RbSlab<T>) -> bool {
-        self.offset_in_node = 0;
-        if let Some(next) =  tree.next(self.node, RIGHT) {
-            self.node = next;
+    pub(crate) fn tree_next_piece(&mut self, tree: &RbSlab<T>) -> bool {
+        if let Some(next) = self.to_next_piece(tree) {
+            *self = next;
             true
         } else {
             false
         }
     }
-    fn prev_piece(&mut self, tree: &RbSlab<T>) -> bool {
-        self.offset_in_node = 0;
-        if let Some(next) =  tree.next(self.node, LEFT) {
-            self.node = next;
+    pub(crate) fn tree_prev_piece(&mut self, tree: &RbSlab<T>) -> bool {
+        if let Some(prev) = self.to_prev_piece(tree) {
+            *self = prev;
             true
         } else {
             false
         }
+    }
+    pub(crate) fn to_next_piece(&self, tree: &RbSlab<T>) -> Option<CursorPos<T>> {
+        tree.next(self.node, RIGHT).map(|next| CursorPos::new(next, 0))
+    }
+    pub(crate) fn to_prev_piece(&self, tree: &RbSlab<T>) -> Option<CursorPos<T>> {
+        tree.next(self.node, LEFT).map(|next| CursorPos::new(next, 0))
     }
 }
 
@@ -180,7 +180,8 @@ impl<'a, T: Summable> Cursor<'a, T> {
     /// Returns the current piece and relative position of the cursor
     /// to the start of the current node in base units
     pub fn get<M: Metric<T>>(&'a self) -> (&'a T, usize) {
-        self.pos.get::<M>(self.tree)
+        let (piece, base) = self.pos.get_base_units(self.tree);
+        (piece, M::from_base_units(piece, base))
     }
     /// Returns the current piece and relative position of the cursor
     /// to the start of the current node in base units
@@ -206,13 +207,13 @@ impl<'a, T: Summable> Cursor<'a, T> {
     ///
     /// Returns `false` if there are no more pieces.
     pub fn next_piece(&mut self) -> bool {
-        self.pos.next_piece(self.tree)
+        self.pos.tree_next_piece(self.tree)
     }
     /// Move the cursor to the previous consecutive piece
     ///
     /// Returns `false` if there are no more pieces.
     pub fn prev_piece(&mut self) -> bool {
-        self.pos.prev_piece(self.tree)
+        self.pos.tree_prev_piece(self.tree)
     }
 }
 
@@ -285,9 +286,10 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::roperig::Rope;
+    use crate::roperig_test::Alphabet;
     use super::*;
 
-    pub fn validate_with_cursor(rb: &Rope<String>) {
+    pub fn validate_with_cursor(rb: &Rope<Alphabet>) {
         let Some(mut cursor) = rb.cursor::<BaseMetric>(0) else {
             assert_eq!(rb.len(), 0);
             assert!(rb.is_empty());
@@ -297,15 +299,42 @@ pub(crate) mod tests {
         loop {
             let (s, offset) = cursor.get_base_units();
             assert_eq!(offset, 0);
-            assert!(!s.is_empty());
-            let next = s.chars().next().unwrap();
+            assert!(!s.0.is_empty());
+            let next = s.0.chars().next().unwrap();
             if let Some(c) = c {
                 assert_ne!(next, c);
             }
-            c = s.chars().next();
+            c = s.0.chars().next();
             if !cursor.next_piece() {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn test_cursor_creation() {
+        let mut rb = Rope::<Alphabet>::default();
+        rb.insert(0, "111".into());
+        rb.insert(3, "222".into());
+
+        let start = rb.cursor::<BaseMetric>(0);
+        assert!(start.is_some());
+        let start = start.unwrap();
+        assert_eq!(start.get_base_units().0.0, "111");
+        assert_eq!(start.get_base_units().1, 0);
+
+        let mid = rb.cursor::<BaseMetric>(3);
+        assert!(mid.is_some());
+        let mid = mid.unwrap();
+        assert_eq!(mid.get_base_units().0.0, "111");
+        assert_eq!(mid.get_base_units().1, 3);
+
+        let end = rb.cursor::<BaseMetric>(6);
+        assert!(end.is_some());
+        let end = end.unwrap();
+        assert_eq!(end.get_base_units().0.0, "222");
+        assert_eq!(end.get_base_units().1, 3);
+
+        assert!(rb.cursor::<BaseMetric>(7).is_none());
     }
 }

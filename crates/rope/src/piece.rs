@@ -44,15 +44,20 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
 }
 
 /// A type with some length properties
+#[allow(clippy::len_without_is_empty)]
 pub trait Summable {
     /// The [Sum] summary type, typically length(s)
     type S: Sum;
     /// Returns a [Sum] containing info to the current object
     fn summarize(&self) -> Self::S;
+    /// Returns [Sum::len] of [Self::summarize]
+    fn len(&self) -> usize {
+        self.summarize().len()
+    }
 }
 
 /// Holds the result of [RopePiece::insert_or_split]
-pub enum SplitResult<T> {
+pub enum SplitResult<T: RopePiece> {
     /// Meaning: the supplied piece has been merged into this node
     Merged,
     /// Meaning: The returned value is the unmerged portion and should
@@ -66,8 +71,30 @@ pub enum SplitResult<T> {
     /// returning the result as `MiddleSplit(unmerged_portion, split_tail)`.
     MiddleSplit(T, T),
 }
+/// Holds the result of [RopePiece::delete_range]
+pub enum DeleteResult<T: RopePiece> {
+    /// Meaning: the deletion is done in place, with the return value
+    /// being the [Sum] of the deleted part.
+    Updated(T::S),
+    /// Meaning: the deletion resulted in node splitting
+    TailSplit { 
+        /// The [Sum] of the deleted part (excluding the split part)
+        deleted: T::S,
+        /// The split piece after the deleted part
+        split: T,
+    },
+}
 
 /// A piece to be stored in a rope node
+///
+/// Note that this is a barebone API that has a few assumptions:
+/// - All nodes are mergeable in a sense.
+///   - This also means that zero-length nodes almost always get merged/deleted.
+/// - Node splits are only a means of optimization.
+///
+/// If the user wishes for a more flexible API (for, for example, expressing
+/// mergeability, zero-width nodes, etc.), they are expected to use the [Cursor]
+/// API instead.
 pub trait RopePiece: Summable + Sized {
     /// Context object for rope pieces
     ///
@@ -81,32 +108,32 @@ pub trait RopePiece: Summable + Sized {
     /// [piece tree]: https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
     type Context;
 
-    /// Precondition to [Self::insert_or_split] when deleting nodes
-    /// 
-    /// If the user wants to exert certain invariants like "some adjacent nodes
-    /// must get merged", they should return `true` in this function.
-    fn must_try_merging(&self, context: &mut Self::Context, other: &Self) -> bool;
     /// Try to insert a new piece into the current piece
     ///
     /// ## For Implementers
     ///
     /// When the piece gets merged, the method should return [SplitResult::Merged].
-    ///
-    /// ### Zero-width pieces with affinity
-    ///
-    /// The current implementation allows zero-width pieces and won't auto-delete them.
-    /// (However, we don't offer a way to ensure their relative position yet.)
-    /// Whether these pieces are to be retained are determined by the user:
-    /// merge zero-width pieces (returning [SplitResult::Merged]) to remove them.
-    ///
-    /// If you want zero-width nodes with node affinity, the best you can do is to
-    /// pack these nodes into a "collection" piece and handle their affinity by
-    /// splitting accordingly.
-    fn insert_or_split(&mut self, context: &mut Self::Context, other: Self, offset: usize) -> SplitResult<Self>;
+    fn insert_or_split(
+        &mut self, context: &mut Self::Context,
+        other: Insertion<Self>, offset: usize,
+    ) -> SplitResult<Self>;
     /// Delete a portion from the current piece and return [Sum] of the deleted part
+    fn delete_range(
+        &mut self, context: &mut Self::Context,
+        from: usize, to: usize,
+    ) -> DeleteResult<Self>;
+    /// Delete the entire piece
     ///
-    /// If the current node should be deleted as a whole, return `None`.
-    fn delete_range(&mut self, context: &mut Self::Context, from: usize, to: usize) -> Option<Self::S>;
+    /// This is mainly for any deallocation logic that should happen in the contexts.
+    fn delete(&mut self, context: &mut Self::Context);
+}
+/// A piece, typically to be inserted, with its [Sum] precomputed
+pub struct Insertion<T: RopePiece>(pub T, pub T::S);
+impl<T: RopePiece> From<T> for Insertion<T> {
+    fn from(value: T) -> Self {
+        let sum = value.summarize();
+        Insertion(value, sum)
+    }
 }
 
 /// A reference to internal nodes, inherently unsafe

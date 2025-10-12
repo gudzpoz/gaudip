@@ -95,6 +95,10 @@ impl<T: Summable> RbSlab<T> {
     pub fn set_root(&mut self, root: Ref) {
         self.root = root;
     }
+    pub fn clear(&mut self) {
+        self.root = SENTINEL;
+        self.slab.clear();
+    }
 
     pub fn insert(&mut self, node: Node<T>) -> SafeRef {
         NonZero::new(self.slab.insert(node)).unwrap()
@@ -103,11 +107,17 @@ impl<T: Summable> RbSlab<T> {
         self.slab.remove(idx.get()).piece
     }
 
-    fn get2(&mut self, idx1: SafeRef, idx2: SafeRef) -> (&mut RbNode, &mut RbNode) {
+    pub fn get2(&mut self, idx1: SafeRef, idx2: SafeRef) -> (&mut RbNode, &mut RbNode) {
         let idx1 = idx1.get();
         let idx2 = idx2.get();
         let (n1, n2) = self.slab.get2_mut(idx1, idx2).unwrap();
         (&mut n1.rb, &mut n2.rb)
+    }
+    pub fn get2_mut(&mut self, idx1: SafeRef, idx2: SafeRef) -> (&mut Node<T>, &mut Node<T>) {
+        let idx1 = idx1.get();
+        let idx2 = idx2.get();
+        let (n1, n2) = self.slab.get2_mut(idx1, idx2).unwrap();
+        (n1, n2)
     }
 }
 pub const LEFT: usize = 0;
@@ -579,6 +589,7 @@ impl<T: Summable> RbSlab<T> {
 #[cfg(test)]
 mod tests {
     use crate::metrics::CursorPos;
+    use crate::roperig_test::Alphabet;
     use super::*;
 
     #[test]
@@ -588,7 +599,7 @@ mod tests {
         assert_eq!(size_of::<Ref>(), size_of::<usize>());
         // Option<CursorPos<T>> should be free because CursorPos contains SafeRef,
         // which is NonZero, and can be used as Option-tagging.
-        type C = CursorPos<String>;
+        type C = CursorPos<Alphabet>;
         assert_eq!(size_of::<Option<C>>(), size_of::<C>());
     }
 }

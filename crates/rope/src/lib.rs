@@ -14,3 +14,6 @@ pub mod roperig;
 
 /// Contains a basic red-black tree implementation based on slab.
 mod rb_base;
+
+#[cfg(test)]
+mod roperig_test;
