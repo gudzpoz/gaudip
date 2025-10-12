@@ -98,11 +98,19 @@ impl<T: Summable> CursorPos<T> {
         (piece, self.offset_in_node)
     }
 
-    fn offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
+    fn rel_offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
+        let piece = &tree[self.node].piece;
+        M::from_base_units(piece, self.offset_in_node)
+    }
+
+    fn abs_offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
         let mut node = self.node;
         let (mut offset, mut parent) = {
             let n = &tree[node];
-            (self.offset_in_node, n.rb.parent)
+            (
+                self.offset_in_node + M::measure(&tree[node].left_sum),
+                n.rb.parent,
+            )
         };
         while let Some(p) = parent {
             let pn = &tree[p];
@@ -116,11 +124,11 @@ impl<T: Summable> CursorPos<T> {
         offset
     }
 
-    pub(crate) fn prev<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
-        self.move_towards::<M>(tree, measurement, LEFT)
-    }
-    pub(crate) fn next<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize) -> bool {
-        self.move_towards::<M>(tree, measurement, RIGHT)
+    pub(crate) fn navigate<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: isize) -> bool {
+        self.move_towards::<M>(
+            tree, measurement.unsigned_abs(),
+            if measurement < 0 { LEFT } else { RIGHT },
+        )
     }
     fn move_towards<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize, dir: usize) -> bool {
         let next = rel_node_at::<T, M>(tree, self.clone(), measurement, dir);
@@ -190,17 +198,14 @@ impl<'a, T: Summable> Cursor<'a, T> {
     }
 
     /// Returns the current absolute offset in specific metric
-    pub fn offset<M: Metric<T>>(&self) -> usize {
-        self.pos.offset::<M>(self.tree)
+    pub fn abs_offset<M: Metric<T>>(&self) -> usize {
+        self.pos.abs_offset::<M>(self.tree)
     }
 
     /// Move backwards `measurement` units
-    pub fn prev<M: Metric<T>>(&mut self, measurement: usize) -> bool {
-        self.pos.prev::<M>(self.tree, measurement)
-    }
     /// Move forwards `measurement` units
-    pub fn next<M: Metric<T>>(&mut self, measurement: usize) -> bool {
-        self.pos.next::<M>(self.tree, measurement)
+    pub fn navigate<M: Metric<T>>(&mut self, measurement: isize) -> bool {
+        self.pos.navigate::<M>(self.tree, measurement)
     }
 
     /// Move the cursor to the next consecutive piece
@@ -220,10 +225,13 @@ impl<'a, T: Summable> Cursor<'a, T> {
 pub(crate) fn rel_node_at_metric<T: Summable, M: Metric<T>>(
     tree: &RbSlab<T>, mut x: Ref, mut offset: usize,
 ) -> Option<CursorPos<T>> {
+    if let Some(x) = x && offset == 0 {
+        return Some(CursorPos::new(tree.edge(x, LEFT), 0));
+    }
     while let Some(xi) = x {
         let n = &tree[xi];
         let left_len = M::measure(&n.left_sum);
-        if left_len >= offset {
+        if left_len >= offset && n.rb.children[0].is_some() {
             x = n.rb.children[0];
         } else {
             let n_len = M::measure(&n.piece.summarize());
@@ -249,7 +257,7 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
     let n = &tree[x];
     if dir == LEFT && let Some(next) = M::navigate(
         &n.piece, from.offset_in_node, (metric_offset as isize).neg(),
-    ) {
+    ) && next != 0 {
         return Some(CursorPos::new(x, next));
     }
     if dir == RIGHT && let Some(next) = M::navigate(
@@ -259,12 +267,12 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
     }
 
     let mut offset_i = M::measure(&n.left_sum) as isize
-        + from.offset::<M>(tree) as isize
+        + from.rel_offset::<M>(tree) as isize
         + if dir == LEFT { -(metric_offset as isize) } else { metric_offset as isize };
     let mut x = Some(x);
     while let Some(xi) = x {
         let n = &tree[xi];
-        if 0 <= offset_i {
+        if 0 < offset_i {
             let subtree = rel_node_at_metric::<T, M>(tree, x, offset_i as usize);
             if subtree.is_some() {
                 return subtree;
@@ -280,14 +288,17 @@ pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
         }
         x = p;
     }
+    if offset_i == 0 {
+        return Some(CursorPos::new(tree.edge(tree.root()?, LEFT), 0));
+    }
     None
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::*;
     use crate::roperig::Rope;
     use crate::roperig_test::Alphabet;
-    use super::*;
 
     pub fn validate_with_cursor(rb: &Rope<Alphabet>) {
         let Some(mut cursor) = rb.cursor::<BaseMetric>(0) else {
@@ -299,12 +310,10 @@ pub(crate) mod tests {
         loop {
             let (s, offset) = cursor.get_base_units();
             assert_eq!(offset, 0);
-            assert!(!s.0.is_empty());
-            let next = s.0.chars().next().unwrap();
-            if let Some(c) = c {
-                assert_ne!(next, c);
-            }
-            c = s.0.chars().next();
+            assert!(!s.is_empty());
+            let next = s.c();
+            assert_ne!(next, c);
+            c = s.c();
             if !cursor.next_piece() {
                 break;
             }
@@ -320,21 +329,66 @@ pub(crate) mod tests {
         let start = rb.cursor::<BaseMetric>(0);
         assert!(start.is_some());
         let start = start.unwrap();
-        assert_eq!(start.get_base_units().0.0, "111");
+        assert_eq!(start.get_base_units().0, &"111".into());
         assert_eq!(start.get_base_units().1, 0);
 
         let mid = rb.cursor::<BaseMetric>(3);
         assert!(mid.is_some());
         let mid = mid.unwrap();
-        assert_eq!(mid.get_base_units().0.0, "111");
+        assert_eq!(mid.get_base_units().0, &"111".into());
         assert_eq!(mid.get_base_units().1, 3);
 
         let end = rb.cursor::<BaseMetric>(6);
         assert!(end.is_some());
         let end = end.unwrap();
-        assert_eq!(end.get_base_units().0.0, "222");
+        assert_eq!(end.get_base_units().0, &"222".into());
         assert_eq!(end.get_base_units().1, 3);
 
         assert!(rb.cursor::<BaseMetric>(7).is_none());
+    }
+
+    #[test]
+    fn test_rel_node_far() {
+        let mut rb = Rope::<Alphabet>::default();
+        for c in ('a'..='z').rev() {
+            rb.insert(0, c.into());
+        }
+        assert_eq!(26, rb.len());
+        let mut start = rb.cursor::<BaseMetric>(0).unwrap();
+        let (piece, offset) = start.get_base_units();
+        assert_eq!(piece, &"a".into());
+        assert_eq!(offset, 0);
+        assert_eq!(0, start.abs_offset::<BaseMetric>());
+
+        struct Step {
+            step: isize,
+            expected_offset: usize,
+            expected_str: &'static str,
+        }
+        let steps = [
+            Step { step: 0, expected_offset: 0, expected_str: "a" },
+            Step { step: 26, expected_offset: 1, expected_str: "z" },
+            Step { step: -26, expected_offset: 0, expected_str: "a" },
+            Step { step: 13, expected_offset: 1, expected_str: "m" },
+            Step { step: 13, expected_offset: 1, expected_str: "z" },
+            Step { step: -13, expected_offset: 1, expected_str: "m" },
+            Step { step: -13, expected_offset: 0, expected_str: "a" },
+            Step { step: 1, expected_offset: 1, expected_str: "a" },
+            Step { step: -1, expected_offset: 0, expected_str: "a" },
+            Step { step: 13, expected_offset: 1, expected_str: "m" },
+            Step { step: 1, expected_offset: 1, expected_str: "n" },
+            Step { step: -1, expected_offset: 1, expected_str: "m" },
+            Step { step: -13, expected_offset: 0, expected_str: "a" },
+        ];
+
+        let mut abs = 0usize;
+        for step in steps {
+            abs = abs.checked_add_signed(step.step).unwrap();
+            assert!(start.navigate::<BaseMetric>(step.step));
+            assert_eq!(abs, start.abs_offset::<BaseMetric>());
+            let (piece, offset) = start.get_base_units();
+            assert_eq!(offset, step.expected_offset);
+            assert_eq!(piece, &step.expected_str.into());
+        }
     }
 }

@@ -97,7 +97,9 @@ impl<T: Summable> RbSlab<T> {
     }
     pub fn clear(&mut self) {
         self.root = SENTINEL;
+        let sentinel = self.slab.remove(0);
         self.slab.clear();
+        assert_eq!(0, self.slab.insert(sentinel));
     }
 
     pub fn insert(&mut self, node: Node<T>) -> SafeRef {
@@ -191,7 +193,7 @@ macro_rules! foreach_parent {
             let $n = &$tree[$x];
             let parent = $n.rb.parent;
             let Some($p) = parent else {
-                debug_assert!(Some($x) == $tree.root);
+                debug_assert!(Some($x) == $tree.root());
                 break None;
             };
             let $pn = &mut $tree[$p];
@@ -206,6 +208,7 @@ macro_rules! foreach_parent {
         foreach_parent!(({ parent: $pn } of $x in $tree) $what)
     };
 }
+pub(crate) use foreach_parent;
 
 impl<T: Summable> RbSlab<T> {
     pub fn next(&self, mut this: SafeRef, dir: usize) -> Ref {

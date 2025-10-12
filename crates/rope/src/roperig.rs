@@ -109,7 +109,7 @@ impl<T: RopePiece> Rope<T> {
     
     /// Converts offsets from one measurement to another
     pub fn convert_metrics<M: Metric<T>, N: Metric<T>>(&self, measurement: usize) -> Option<usize> {
-        self.cursor::<M>(measurement).map(|c| c.offset::<N>())
+        self.cursor::<M>(measurement).map(|c| c.abs_offset::<N>())
     }
 
     /// Batch insert multiple values at consecutive nodes
@@ -362,7 +362,7 @@ impl<T: RopePiece> CursorPos<T> {
         }
         let start = self;
         let mut end = start.clone();
-        let end = if end.next::<BaseMetric>(&rope.tree, len) {
+        let end = if end.navigate::<BaseMetric>(&rope.tree, len as isize) {
             end
         } else if let Some(root) = rope.tree.root() {
             let end = rope.tree.edge(root, RIGHT);
@@ -587,9 +587,10 @@ mod tests {
                 rope.insert_merging(*offset, (*inserted).into());
             }
             for (i, node) in result.iter().enumerate() {
+                let node: Option<Alphabet> = node.map(|n| n.into());
                 assert_eq!(
-                    node,
-                    &rope.tree.slab_get(i + 1).map(|n| n.piece.0.as_str()),
+                    node.as_ref(),
+                    rope.tree.slab_get(i + 1).map(|n| &n.piece),
                 );
             }
             assert!(rope.tree.slab_len() <= result.len() + 1);
@@ -617,7 +618,8 @@ mod tests {
     fn assert_pos(pos: Option<PiecePosition<Alphabet>>, s: &str, offset: usize) {
         assert!(pos.is_some());
         let pos = pos.unwrap();
-        assert_eq!((s, offset), (pos.piece.0.as_str(), pos.offset_in_piece));
+        let expect: Alphabet = s.into();
+        assert_eq!((&expect, offset), (pos.piece, pos.offset_in_piece));
     }
 
     #[test]
@@ -658,9 +660,9 @@ mod tests {
             let end_off = if idx == end.node {
                 end.offset_in_node
             } else {
-                piece.0.len()
+                piece.len()
             };
-            s.push_str(&piece.0[offset..end_off]);
+            s.push_str(&piece.c().unwrap().to_string().repeat(end_off - offset));
             if idx == end.node {
                 break;
             }
@@ -770,6 +772,43 @@ mod tests {
     }
 
     #[test]
+    fn test_clear() {
+        let mut rb = Rope::<Alphabet>::default();
+        rb.insert(0, "111".into());
+        rb.insert(3, "222".into());
+        rb.insert(6, "333".into());
+        rb.delete(0, 9);
+        rb.is_valid();
+        assert_eq!("", gather(&rb));
+        assert_eq!(0, rb.sum);
+        rb.insert(0, "111".into());
+        rb.insert(3, "222".into());
+        assert_eq!("111222", gather(&rb));
+    }
+
+    #[test]
+    fn test_delete() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        for i in 0..1000 {
+            let mut expected = String::default();
+            let mut rb = Rope::<Alphabet>::default();
+            for c in '0'..='9' {
+                let s = c.to_string().repeat(if c == '9' { 5 } else { 10 });
+                let at = expected.len() / 2;
+                expected.insert_str(at, &s);
+                rb.insert(at, s.into());
+            }
+            assert_eq!(expected, gather(&rb));
+            let from = rng.random_range(0..=(expected.len()/2));
+            let to = rng.random_range((expected.len()/2)..=expected.len());
+            rb.delete_merging(from, to - from, |a, b| a.is_mergeable(b));
+            expected.drain(from..to);
+            assert_eq!(expected.len(), rb.len(), "{}: from: {}, to: {}", i, from, to);
+            assert_eq!(expected, gather(&rb));
+        }
+    }
+
+    #[test]
     fn test_many_insert() {
         let mut rb: Rope<Alphabet> = Rope::default();
         let mut expected = String::default();
@@ -777,7 +816,7 @@ mod tests {
         for _ in 0..10000 {
             let char: Alphabet = rng.random_range('a'..='z').into();
             let pos = if expected.is_empty() { 0 } else { rng.random_range(0..expected.len()) };
-            expected.insert_str(pos, &char.0);
+            expected.insert(pos, char.c().unwrap());
             rb.insert_merging(pos, char);
             let (mut start, mut end) = (
                 rng.random_range(0..expected.len()),
