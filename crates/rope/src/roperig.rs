@@ -216,6 +216,44 @@ impl<T: RopePiece> Rope<T> {
         pos.map(|c| c.cursor(&self.tree))
     }
 
+    /// Iterate over the rope within the range
+    pub fn for_range<M: Metric<T>>(
+        &self, range: Range<usize>,
+        mut f: impl FnMut(&T::Context, &T, Range<usize>) -> bool,
+    ) {
+        let Some(start) = self.cursor::<M>(range.start) else { return };
+        let start = start.inner();
+        let mut end = start.clone();
+        let end = if end.navigate::<BaseMetric>(&self.tree, range.len() as isize) {
+            end
+        } else {
+            let node = self.tree.edge(self.tree.root().unwrap(), RIGHT);
+            CursorPos::new(node, self.tree[node].piece.len())
+        };
+
+        let mut i = Some(start.node);
+        while let Some(idx) = i {
+            let offset = if idx == start.node {
+                start.offset_in_node
+            } else {
+                0
+            };
+            let piece = &self.tree[idx].piece;
+            let end_off = if idx == end.node {
+                end.offset_in_node
+            } else {
+                piece.len()
+            };
+            if !f(&self.context, piece, offset..end_off) {
+                break;
+            }
+            if idx == end.node {
+                break;
+            }
+            i = self.tree.next(idx, RIGHT);
+        }
+    }
+
     fn rb_insert(&mut self, node: Ref, piece: T, dir: usize) -> SafeRef {
         let z = self.tree.insert(Node::new(piece));
         match node {
@@ -646,28 +684,13 @@ mod tests {
         substring(rope, 0, rope.sum.len())
     }
     fn substring(rope: &Rope<Alphabet>, start: usize, end: usize) -> String {
-        let Some(start) = rope.node_at(start) else { return "".to_string(); };
-        let Some(end) = rope.node_at(end) else { return "".to_string(); };
-        let mut i = Some(start.node);
-        let mut s = String::default();
-        while let Some(idx) = i {
-            let offset = if idx == start.node {
-                start.offset_in_node
-            } else {
-                0
-            };
-            let piece = &rope.tree[idx].piece;
-            let end_off = if idx == end.node {
-                end.offset_in_node
-            } else {
-                piece.len()
-            };
-            s.push_str(&piece.c().unwrap().to_string().repeat(end_off - offset));
-            if idx == end.node {
-                break;
+        let mut s = String::with_capacity(end - start);
+        rope.for_range::<BaseMetric>(start..end, |_, piece, range| {
+            if !range.is_empty() {
+                s.push_str(&piece.c().unwrap().to_string().repeat(range.len()));
             }
-            i = rope.tree.next(idx, RIGHT);
-        }
+            true
+        });
         s
     }
 

@@ -166,3 +166,18 @@ impl Into<usize> for TransientRef {
         self.0.get()
     }
 }
+
+impl Sum for () {
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn add_assign(&mut self, _other: &Self) {
+    }
+
+    fn sub_assign(&mut self, _other: &Self) {
+    }
+
+    fn identity() -> Self {
+    }
+}

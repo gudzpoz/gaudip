@@ -12,6 +12,10 @@ pub mod piece;
 /// The rope implementation.
 pub mod roperig;
 
+/// Contains a [String] rope implementation based on [roperig].
+#[cfg(feature = "rope")]
+pub mod rope;
+
 /// Contains a basic red-black tree implementation based on slab.
 mod rb_base;
 
