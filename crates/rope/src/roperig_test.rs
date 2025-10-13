@@ -1,4 +1,6 @@
+use crate::metrics::BaseMetric;
 use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
+use crate::roperig::Rope;
 
 impl Sum for usize {
     fn len(&self) -> usize {
@@ -102,5 +104,19 @@ impl RopePiece for Alphabet {
         DeleteResult::Updated(to - from)
     }
     fn delete(&mut self, _: &mut ()) {
+    }
+}
+
+impl Rope<Alphabet> {
+    /// Utility function for testing: to string
+    pub fn substring(&self, start: usize, end: usize) -> String {
+        let mut s = String::with_capacity(end - start);
+        self.for_range::<BaseMetric>(start..end, |_, piece, range| {
+            if !range.is_empty() {
+                s.push_str(&piece.c().unwrap().to_string().repeat(range.len()));
+            }
+            true
+        });
+        s
     }
 }

@@ -43,7 +43,7 @@
 
 use crate::metrics::{rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
 use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum};
-use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT};
+use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT, SENTINEL};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -149,10 +149,6 @@ impl<T: RopePiece> Rope<T> {
     pub fn delete(&mut self, offset: usize, len: usize) {
         if len == 0 {
             return;
-        }
-        if offset == 0 && len == self.sum.len() {
-            self.sum = T::S::identity();
-            self.tree.clear();
         }
         if let Some(pos) = self.node_at_metric::<BaseMetric>(offset) {
             pos.delete_len(self, len);
@@ -284,20 +280,81 @@ impl<T: RopePiece> Rope<T> {
         self.tree.delete(node)
     }
 
-    fn delete_nodes(&mut self, nodes: Vec<SafeRef>) {
-        for node in nodes {
-            self.safe_delete(node);
-        }
-    }
-
     fn recompute_metadata(&mut self) {
         self.sum = self.tree.calculate_sum(self.tree.root());
     }
-    
+
+    fn insert_many<I>(
+        &mut self, cursor: Option<&CursorPos<T>>, side: usize, size: usize, mut pieces: I,
+    ) where I: Iterator<Item = T> {
+        if size == 0 {
+            return;
+        }
+        if size == 1 {
+            let piece = pieces.next().unwrap();
+            self.sum.add_assign(&piece.summarize());
+            self.rb_insert(cursor.map(|c| c.node), piece, side);
+            return;
+        }
+        let Some(cursor) = cursor else {
+            assert_eq!(None, self.tree.root());
+            let Some((root, sum)) = self.tree.build_from_sorted(size, &mut pieces) else {
+                unreachable!()
+            };
+            self.tree.set_root(Some(root));
+            self.sum = sum;
+            return;
+        };
+        let sum = self.tree.batch_insert(cursor.node, side, size, pieces);
+        self.sum.add_assign(&sum);
+    }
+
+    /// Batch inserts a sequence of pieces *after this piece*
+    ///
+    /// Please note that the insertion point is *not at this cursor*,
+    /// but after this whole piece. The user might need to manually
+    /// split the current piece (with [Self::update] and [Self::insert_right]).
+    ///
+    /// The function will panic if the supplied `size` does not match the
+    /// iterator's length.
+    pub fn insert_many_after<I>(
+        &mut self, cursor: Option<&CursorPos<T>>, size: usize, pieces: I,
+    ) where I: Iterator<Item = T> {
+        self.insert_many(cursor, RIGHT, size, pieces);
+    }
+
+    /// Batch inserts a sequence of pieces *before this piece*
+    ///
+    /// See [Self::insert_many_after] for more details.
+    pub fn insert_many_before<I>(
+        &mut self, cursor: Option<&CursorPos<T>>, size: usize, pieces: I,
+    ) where I: Iterator<Item = T> {
+        self.insert_many(cursor, LEFT, size, pieces);
+    }
+
+    /// Batch deletes a range of pieces from this piece to `to` (inclusive).
+    pub fn delete_many_to(&mut self, from: CursorPos<T>, to: CursorPos<T>) {
+        if from.node == to.node {
+            from.delete(self);
+            return;
+        }
+        self.tree.batch_delete(
+            from.node, to.node,
+            |mut p| p.delete(&mut self.context),
+        );
+        self.recompute_metadata();
+    }
+
     #[cfg(test)]
-    fn is_valid(&self) {
+    pub(crate) fn is_valid(&self) {
         let sum = self.tree.is_valid();
-        assert!(sum == self.sum);
+        assert!(sum == self.sum, "len: {} != {}", sum.len(), self.sum.len());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compact(&mut self) -> &RbSlab<T> {
+        self.tree.compact(|_, _, _| true);
+        &self.tree
     }
 }
 
@@ -436,7 +493,6 @@ impl<T: RopePiece> CursorPos<T> {
             return Some(start);
         }
 
-        let mut del_nodes = vec![];
         let del_part =
             |this: &mut Rope<T>, node: SafeRef, range: Range<usize>| {
                 let piece = &mut this.tree[node].piece;
@@ -453,30 +509,42 @@ impl<T: RopePiece> CursorPos<T> {
                 }
             };
 
+        let mut del_range = [SENTINEL, SENTINEL];
+
+        let start_node = start.node;
         let mut valid: Option<Self> = if start.offset_in_node == 0 {
-            let prev = start.to_prev_piece(&rope.tree);
-            del_nodes.push(start.node);
-            prev
+            del_range[0] = Some(start.node);
+            start.to_prev_piece(&rope.tree)
         } else {
+            let del = rope.tree.next(start.node, RIGHT);
+            del_range[0] = if del == Some(end.node) { SENTINEL } else { del };
             del_part(rope, start.node, start.offset_in_node..usize::MAX);
-            Some(start.clone())
+            Some(start)
         };
 
         valid = valid.or(if end.offset_in_node == rope.tree[end.node].piece.len() {
-            let next = end.to_next_piece(&rope.tree);
-            del_nodes.push(end.node);
-            next
+            del_range[1] = Some(end.node);
+            end.to_next_piece(&rope.tree)
         } else {
+            let del = rope.tree.next(end.node, LEFT);
+            del_range[1] = if del == Some(start_node) { SENTINEL } else { del };
             del_part(rope, end.node, 0..end.offset_in_node);
-            Some(end.clone())
+            Some(end)
         });
 
-        let mut del_i = rope.tree.next(start.node, RIGHT);
-        while let Some(del_i_) = del_i && del_i_ != end.node {
-            del_nodes.push(del_i_);
-            del_i = rope.tree.next(del_i_, RIGHT);
+        match del_range {
+            [Some(l), Some(r)] => {
+                rope.delete_many_to(
+                    CursorPos::new(l, 0),
+                    CursorPos::new(r, usize::MAX),
+                )
+            }
+            other => {
+                for node in other.into_iter().flatten() {
+                    rope.safe_delete(node);
+                }
+            }
         }
-        rope.delete_nodes(del_nodes);
 
         rope.recompute_metadata();
 
@@ -681,17 +749,7 @@ mod tests {
     }
 
     fn gather(rope: &Rope<Alphabet>) -> String {
-        substring(rope, 0, rope.sum.len())
-    }
-    fn substring(rope: &Rope<Alphabet>, start: usize, end: usize) -> String {
-        let mut s = String::with_capacity(end - start);
-        rope.for_range::<BaseMetric>(start..end, |_, piece, range| {
-            if !range.is_empty() {
-                s.push_str(&piece.c().unwrap().to_string().repeat(range.len()));
-            }
-            true
-        });
-        s
+        rope.substring(0, rope.sum.len())
     }
 
     #[test]
@@ -849,7 +907,7 @@ mod tests {
                 std::mem::swap(&mut start, &mut end);
             }
             assert_eq!(expected.len(), rb.sum.len());
-            assert_eq!(expected[start..end], substring(&rb, start, end));
+            assert_eq!(expected[start..end], rb.substring(start, end));
             validate_with_cursor(&rb);
         }
 
