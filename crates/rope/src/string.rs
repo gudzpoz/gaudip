@@ -1,15 +1,15 @@
 use std::ops::Range;
-use crate::metrics::{BaseMetric, CharMetric, WithCharMetric};
-use crate::piece::RopePiece;
+use crate::metrics::{BaseMetric, CharMetric, Metric, WithCharMetric};
+use crate::piece::{RopePiece, Sum};
 use crate::roperig::Rope;
 
 /// A utility trait for types that contain a rope
-/// 
+///
 /// It contains some convenience methods for string-like ropes.
 pub trait RopeContainer<T: RopePiece + WithCharMetric> {
     /// Returns a reference to the contained rope
     fn rope(&self) -> &Rope<T>;
-    
+
     /// Returns a mutable reference to the contained rope
     fn rope_mut(&mut self) -> &mut Rope<T>;
 
@@ -32,7 +32,7 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
     fn substring(&self, range: Range<usize>) -> String {
         self.rope().substring(range)
     }
-    
+
     /// Appends the substring of the rope into `buffer`
     fn substring_store(&self, range: Range<usize>, buffer: &mut String) {
         self.rope().substring_store(range, buffer)
@@ -47,7 +47,7 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
     fn byte_to_char(&self, offset: usize) -> usize {
         self.rope().byte_to_char(offset)
     }
-    
+
     /// Deletes a range of bytes
     fn delete_bytes(&mut self, range: Range<usize>) {
         self.rope_mut().delete(range)
@@ -58,7 +58,7 @@ impl<T: RopePiece + WithCharMetric> Rope<T> {
     /// Returns a substring of the rope
     pub fn substring_store(&self, range: Range<usize>, out: &mut String) {
         self.for_range::<BaseMetric>(range, |ctx, s, range| {
-            s.substring(ctx, range.start, range.end, |sub| out.push_str(sub));
+            s.substring(ctx, range.start.len(), range.end.len(), |sub| out.push_str(sub));
             true
         });
     }
@@ -71,13 +71,13 @@ impl<T: RopePiece + WithCharMetric> Rope<T> {
     /// Converts a char offset to a byte offset
     pub fn char_to_byte(&self, offset: usize) -> usize {
         self.cursor::<CharMetric>(offset)
-            .map(|c| c.abs_offset::<BaseMetric>())
+            .map(|c| <BaseMetric as Metric<T>>::measure(&c.abs_offset()))
             .unwrap_or(self.len())
     }
     /// Converts a byte offset to a char offset
     pub fn byte_to_char(&self, offset: usize) -> usize {
         self.cursor::<BaseMetric>(offset)
-            .map(|c| c.abs_offset::<CharMetric>())
+            .map(|c| <CharMetric as Metric<T>>::measure(&c.abs_offset()))
             .unwrap_or(self.len())
     }
 }

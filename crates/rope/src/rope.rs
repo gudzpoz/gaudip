@@ -107,7 +107,8 @@ impl<Ext: Sum + FromStr> RopeContainer<StringExt<Ext>> for StringRope<Ext> {
 impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     type Context = ();
 
-    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Insertion<Self>, offset: usize) -> SplitResult<Self> {
+    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
+        let offset = offset.len();
         let len = self.s.len() + other.0.s.len();
         if offset == 0 {
             if len > MAX_PIECE_SIZE {
@@ -146,7 +147,9 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
         SplitResult::Merged
     }
 
-    fn delete_range(&mut self, _context: &mut Self::Context, from: usize, to: usize) -> DeleteResult<Self> {
+    fn delete_range(&mut self, _context: &mut Self::Context, from: &Self::S, to: &Self::S) -> DeleteResult<Self> {
+        let from = from.len();
+        let to = to.len();
         let extra = Ext::from_str(&self.s[from..to]);
         let chars = self.s[from..to].chars().count();
         self.s.drain(from..to);
@@ -158,6 +161,14 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     }
 
     fn delete(&mut self, _context: &mut Self::Context) {
+    }
+
+    fn measure_offset(&self, _context: &Self::Context, base_offset: usize) -> Self::S {
+        StringSum {
+            bytes: base_offset,
+            chars: self.s[..base_offset].chars().count(),
+            extra: Ext::from_str(&self.s[..base_offset]),
+        }
     }
 }
 

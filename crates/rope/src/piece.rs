@@ -1,4 +1,4 @@
-use crate::rb_base::SafeRef;
+use crate::{metrics::Metric, rb_base::SafeRef};
 
 /// Summary for a [Summable]
 ///
@@ -14,17 +14,17 @@ use crate::rb_base::SafeRef;
 // can be confusing at least.
 #[allow(clippy::len_without_is_empty)]
 pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
-    /// Length in base units (see [crate::metrics::Metric])
+    /// Length in base units (see [Metric])
     fn len(&self) -> usize;
 
     /// Adds to this sum/summary
-    /// 
+    ///
     /// Note that one should probably use signed numbers or
-    /// [usize::wrapping_add] for this, because there will be 
+    /// [usize::wrapping_add] for this, because there will be
     /// negative deltas when deleting nodes.
     fn add_assign(&mut self, other: &Self);
     /// The inverse of [Self::add_assign]
-    /// 
+    ///
     /// Similarly, usage of signed numbers or wrapping sub is
     /// recommended.
     fn sub_assign(&mut self, other: &Self);
@@ -41,11 +41,27 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
         zero.sub_assign(self);
         zero
     }
+
+    /// Returns a copy of the added sum
+    fn add(&self, other: &Self) -> Self {
+        let mut sum = *self;
+        sum.add_assign(other);
+        sum
+    }
+}
+/// A simple trait to avoid generic brackets
+pub trait Measured<T: RopePiece> {
+    fn get<M: Metric<T>>(&self) -> usize;
+}
+impl<T: RopePiece> Measured<T> for T::S {
+    fn get<M: Metric<T>>(&self) -> usize {
+        M::measure(self)
+    }
 }
 
 /// A type with some length properties
 #[allow(clippy::len_without_is_empty)]
-pub trait Summable {
+pub trait Summable: Sized {
     /// The [Sum] summary type, typically length(s)
     type S: Sum;
     /// Returns a [Sum] containing info to the current object
@@ -77,7 +93,7 @@ pub enum DeleteResult<T: RopePiece> {
     /// being the [Sum] of the deleted part.
     Updated(T::S),
     /// Meaning: the deletion resulted in node splitting
-    TailSplit { 
+    TailSplit {
         /// The [Sum] of the deleted part (excluding the split part)
         deleted: T::S,
         /// The split piece after the deleted part
@@ -115,17 +131,20 @@ pub trait RopePiece: Summable + Sized {
     /// When the piece gets merged, the method should return [SplitResult::Merged].
     fn insert_or_split(
         &mut self, context: &mut Self::Context,
-        other: Insertion<Self>, offset: usize,
+        other: Insertion<Self>, offset: &Self::S,
     ) -> SplitResult<Self>;
     /// Delete a portion from the current piece and return [Sum] of the deleted part
     fn delete_range(
         &mut self, context: &mut Self::Context,
-        from: usize, to: usize,
+        from: &Self::S, to: &Self::S,
     ) -> DeleteResult<Self>;
     /// Delete the entire piece
     ///
     /// This is mainly for any deallocation logic that should happen in the contexts.
     fn delete(&mut self, context: &mut Self::Context);
+
+    /// Returns the relative metrics at the given offset
+    fn measure_offset(&self, context: &Self::Context, base_offset: usize) -> Self::S;
 }
 /// A piece, typically to be inserted, with its [Sum] precomputed
 pub struct Insertion<T: RopePiece>(pub T, pub T::S);

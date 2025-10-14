@@ -42,7 +42,7 @@
 // See crates/rope/LICENSE for more license information.
 
 use crate::metrics::{rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
-use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum};
+use crate::piece::{DeleteResult, Insertion, Measured, RopePiece, SplitResult, Sum};
 use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT, SENTINEL};
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -60,13 +60,13 @@ impl<T: RopePiece> Default for Rope<T> where T::Context: Default {
 }
 
 /// Information about a particular position in tree
-pub struct PiecePosition<'a, T> {
+pub struct PiecePosition<'a, T: RopePiece> {
     /// The piece that the position lies in
     pub piece: &'a T,
     /// The relative offset of the position in base metric
     ///
     /// This offset can be at the end of the piece (`piece.len()`).
-    pub offset_in_piece: usize,
+    pub offset_in_piece: T::S,
 }
 
 impl<T: RopePiece> Rope<T> {
@@ -87,29 +87,29 @@ impl<T: RopePiece> Rope<T> {
     pub fn context_mut(&mut self) -> &mut T::Context {
         &mut self.context
     }
-    
+
     /// Check if the rope contains nothing
     pub fn is_empty(&self) -> bool {
         self.tree.root().is_none()
     }
-    
+
     /// Returns the length of the rope
-    /// 
+    ///
     /// Note that we allow zero-length nodes, like markers.
     /// So zero-length does not imply an empty tree.
     /// Use [Self::is_empty] for empty checking.
     pub fn len(&self) -> usize {
         self.sum.len()
     }
-    
+
     /// Return the measurement of the whole tree
     pub fn measure<M: Metric<T>>(&self) -> usize {
         M::measure(&self.sum)
     }
-    
+
     /// Converts offsets from one measurement to another
     pub fn convert_metrics<M: Metric<T>, N: Metric<T>>(&self, measurement: usize) -> Option<usize> {
-        self.cursor::<M>(measurement).map(|c| c.abs_offset::<N>())
+        self.cursor::<M>(measurement).map(|c| c.abs_offset().get::<N>())
     }
 
     /// Batch insert multiple values at consecutive nodes
@@ -200,7 +200,7 @@ impl<T: RopePiece> Rope<T> {
         if offset == 0 {
             let mut x = x?;
             x = tree.edge(x, LEFT);
-            Some(CursorPos::new(x, 0))
+            Some(CursorPos::new(x, T::S::identity()))
         } else {
             rel_node_at_metric::<T, M>(tree, context, x, offset)
         }
@@ -217,7 +217,7 @@ impl<T: RopePiece> Rope<T> {
     /// Iterate over the rope within the range
     pub fn for_range<M: Metric<T>>(
         &self, range: Range<usize>,
-        mut f: impl FnMut(&T::Context, &T, Range<usize>) -> bool,
+        mut f: impl FnMut(&T::Context, &T, Range<T::S>) -> bool,
     ) {
         let Some(start) = self.cursor::<M>(range.start) else { return };
         let start = start.inner();
@@ -226,7 +226,7 @@ impl<T: RopePiece> Rope<T> {
             end
         } else {
             let node = self.tree.edge(self.tree.root().unwrap(), RIGHT);
-            CursorPos::new(node, self.tree[node].piece.len())
+            CursorPos::new(node, self.tree[node].piece.summarize())
         };
 
         let mut i = Some(start.node);
@@ -234,13 +234,13 @@ impl<T: RopePiece> Rope<T> {
             let offset = if idx == start.node {
                 start.offset_in_node
             } else {
-                0
+                T::S::identity()
             };
             let piece = &self.tree[idx].piece;
             let end_off = if idx == end.node {
                 end.offset_in_node
             } else {
-                piece.len()
+                piece.summarize()
             };
             if !f(&self.context, piece, offset..end_off) {
                 break;
@@ -362,11 +362,11 @@ impl<T: RopePiece> Rope<T> {
 
 impl<T: RopePiece> CursorPos<T> {
     /// Get necessary information to get value from the piece
-    pub fn get<'a>(&self, rope: &'a Rope<T>) -> (&'a T, usize, &'a T::Context) {
+    pub fn get<'a>(&self, rope: &'a Rope<T>) -> (&'a T, T::S, &'a T::Context) {
         (&rope.tree[self.node].piece, self.offset_in_node, &rope.context)
     }
     /// Get necessary information to mutate value from the piece
-    pub fn get_mut<'a>(&self, rope: &'a mut Rope<T>) -> (&'a mut T, usize, &'a mut T::Context) {
+    pub fn get_mut<'a>(&self, rope: &'a mut Rope<T>) -> (&'a mut T, T::S, &'a mut T::Context) {
         (&mut rope.tree[self.node].piece, self.offset_in_node, &mut rope.context)
     }
 
@@ -375,20 +375,20 @@ impl<T: RopePiece> CursorPos<T> {
     /// Returns a new cursor pointing to the start of the inserted node
     pub fn insert_left(&self, rope: &mut Rope<T>, piece: T) -> Self {
         let new = rope.rb_insert(Some(self.node), piece, LEFT);
-        Self::new(new, 0)
+        Self::new(new, T::S::identity())
     }
     /// Inserts a new piece as a new node to the right of the current node
     ///
     /// Returns a new cursor pointing to the start of the inserted node
     pub fn insert_right(&self, rope: &mut Rope<T>, piece: T) -> Self {
         let new = rope.rb_insert(Some(self.node), piece, RIGHT);
-        Self::new(new, 0)
+        Self::new(new, T::S::identity())
     }
     /// Updates the metadata of parent nodes and moves the cursor forward
     ///
     /// Note that it does not update the metadata of the tree ([Rope.sum]).
     fn node_update(&mut self, rope: &mut Rope<T>, delta: &T::S) {
-        self.offset_in_node = self.offset_in_node.wrapping_add(delta.len());
+        self.offset_in_node.add_assign(delta);
         rope.tree.update_metadata(self.node, delta);
     }
     /// Update the summary of the current node by `delta`
@@ -405,7 +405,7 @@ impl<T: RopePiece> CursorPos<T> {
             Some(next)
         } else if next.prev_piece(rope) {
             let node = next.node;
-            let len = rope.tree[node].piece.len();
+            let len = rope.tree[node].piece.summarize();
             Some(CursorPos::new(next.node, len))
         } else {
             None
@@ -422,12 +422,12 @@ impl<T: RopePiece> CursorPos<T> {
     ) -> Option<Self> {
         let pos = self.delete_len(rope, len)?;
         let mut copy = pos.clone();
-        let (mut left, right) = if pos.offset_in_node == 0 {
+        let (mut left, right) = if pos.offset_in_node == T::S::identity() {
             if !copy.prev_piece(rope) {
                 return None;
             }
-            (CursorPos::new(copy.node, rope.tree[copy.node].piece.len()), pos)
-        } else if pos.offset_in_node == rope.tree[pos.node].piece.len() {
+            (CursorPos::new(copy.node, rope.tree[copy.node].piece.summarize()), pos)
+        } else if pos.offset_in_node.len() == rope.tree[pos.node].piece.len() {
             if !copy.next_piece(rope) {
                 return None;
             }
@@ -452,8 +452,8 @@ impl<T: RopePiece> CursorPos<T> {
             return Some(self);
         }
 
-        if self.offset_in_node != 0
-            && self.offset_in_node == rope.tree[self.node].piece.len()
+        if self.offset_in_node.len() != 0
+            && self.offset_in_node.len() == rope.tree[self.node].piece.len()
             && !self.next_piece(rope) {
             return Some(self);
         }
@@ -463,17 +463,18 @@ impl<T: RopePiece> CursorPos<T> {
             end
         } else if let Some(root) = rope.tree.root() {
             let end = rope.tree.edge(root, RIGHT);
-            CursorPos::new(end, rope.tree[end].piece.len())
+            CursorPos::new(end, rope.tree[end].piece.summarize())
         } else {
             return Some(start);
         };
 
         if start.node == end.node {
-            if start.offset_in_node == 0 && end.offset_in_node == rope.tree[start.node].piece.len() {
+            if start.offset_in_node.len() == 0
+                && end.offset_in_node.len() == rope.tree[start.node].piece.len() {
                 return start.delete(rope).0;
             }
             let summary = rope.tree[start.node].piece.delete_range(
-                &mut rope.context, start.offset_in_node, end.offset_in_node,
+                &mut rope.context, &start.offset_in_node, &end.offset_in_node,
             );
             match summary {
                 DeleteResult::Updated(deleted) => {
@@ -496,14 +497,10 @@ impl<T: RopePiece> CursorPos<T> {
         }
 
         let del_part =
-            |this: &mut Rope<T>, node: SafeRef, range: Range<usize>| {
+            |this: &mut Rope<T>, node: SafeRef, from: T::S, to: Option<T::S>| {
                 let piece = &mut this.tree[node].piece;
                 let summary = piece.delete_range(
-                    &mut this.context, range.start, if range.end == usize::MAX {
-                        piece.len()
-                    } else {
-                        range.end
-                    },
+                    &mut this.context, &from, &to.unwrap_or(piece.summarize()),
                 );
                 let DeleteResult::Updated(deleted) = summary else { unreachable!() };
                 if deleted != T::S::identity() {
@@ -514,31 +511,31 @@ impl<T: RopePiece> CursorPos<T> {
         let mut del_range = [SENTINEL, SENTINEL];
 
         let start_node = start.node;
-        let mut valid: Option<Self> = if start.offset_in_node == 0 {
+        let mut valid: Option<Self> = if start.offset_in_node.len() == 0 {
             del_range[0] = Some(start.node);
             start.to_prev_piece(&rope.tree)
         } else {
             let del = rope.tree.next(start.node, RIGHT);
             del_range[0] = if del == Some(end.node) { SENTINEL } else { del };
-            del_part(rope, start.node, start.offset_in_node..usize::MAX);
+            del_part(rope, start.node, start.offset_in_node, None);
             Some(start)
         };
 
-        valid = valid.or(if end.offset_in_node == rope.tree[end.node].piece.len() {
+        valid = valid.or(if end.offset_in_node.len() == rope.tree[end.node].piece.len() {
             del_range[1] = Some(end.node);
             end.to_next_piece(&rope.tree)
         } else {
             let del = rope.tree.next(end.node, LEFT);
             del_range[1] = if del == Some(start_node) { SENTINEL } else { del };
-            del_part(rope, end.node, 0..end.offset_in_node);
+            del_part(rope, end.node, T::S::identity(), Some(end.offset_in_node));
             Some(end)
         });
 
         match del_range {
             [Some(l), Some(r)] => {
                 rope.delete_many_to(
-                    CursorPos::new(l, 0),
-                    CursorPos::new(r, usize::MAX),
+                    CursorPos::new(l, T::S::identity()),
+                    CursorPos::new(r, T::S::identity()),
                 )
             }
             other => {
@@ -584,7 +581,7 @@ impl<T: RopePiece> CursorPos<T> {
     fn insert_1(&mut self, rope: &mut Rope<T>, value: Insertion<T>) -> SplitResult<T> {
         let obj = &mut rope.tree[self.node];
         let mut summary = value.1;
-        let result = obj.piece.insert_or_split(&mut rope.context, value, self.offset_in_node);
+        let result = obj.piece.insert_or_split(&mut rope.context, value, &self.offset_in_node);
         match &result {
             SplitResult::Merged => self.node_update(rope, &summary),
             SplitResult::MiddleSplit(mid, tail) => {
@@ -617,13 +614,13 @@ impl<T: RopePiece> CursorPos<T> {
                 rope.rb_insert(Some(self.node), head, LEFT);
             }
             SplitResult::TailSplit(tail) => {
-                let len = tail.len();
+                let len = tail.summarize();
                 self.node = rope.rb_insert(Some(self.node), tail, RIGHT);
                 self.offset_in_node = len;
             }
             SplitResult::MiddleSplit(mid, tail) => {
                 let node = rope.rb_insert(Some(self.node), mid, RIGHT);
-                let len = tail.len();
+                let len = tail.summarize();
                 self.node = rope.rb_insert(Some(node), tail, RIGHT);
                 self.offset_in_node = len;
             }
@@ -637,7 +634,7 @@ impl<T: RopePiece> CursorPos<T> {
             SplitResult::HeadSplit(head) => {
                 let mut prev = self.clone();
                 if prev.prev_piece(rope) {
-                    prev.offset_in_node = rope.tree[self.node].piece.len();
+                    prev.offset_in_node = rope.tree[self.node].piece.summarize();
                     let result = prev.insert_1(rope, head.into());
                     prev.insert_2_insert(rope, result);
                 } else {
@@ -656,7 +653,7 @@ impl<T: RopePiece> CursorPos<T> {
             let result = self.insert_1(rope, tail.into());
             self.insert_2_insert(rope, result);
         } else {
-            let len = tail.len();
+            let len = tail.summarize();
             self.node = rope.rb_insert(Some(self.node), tail, RIGHT);
             self.offset_in_node = len;
         }
@@ -948,7 +945,7 @@ mod tests {
 
         rb.is_valid(); // will panic if it must
         assert_alpha_off(&rb, 5, 0);
-        
+
         let delete_merging = |rb: &mut Rope<Alphabet>, from: usize, len: usize| {
             rb.delete_merging(from..from + len, |a, b| {
                 a.is_mergeable(b)

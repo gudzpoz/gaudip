@@ -18,7 +18,7 @@ pub trait Metric<T: RopePiece> {
     /// Converts from base units (as is returned by [Sum::len]) to this measurement
     ///
     /// This should truncate to the nearest previous metric unit boundary.
-    fn from_base_units(context: &T::Context,piece: &T, base_units: usize) -> usize;
+    fn from_base_units(context: &T::Context, piece: &T, base_units: usize) -> usize;
     /// Converts from this measurement to base units (as is returned by [Sum::len])
     #[allow(clippy::wrong_self_convention)]
     fn to_base_units(context: &T::Context, piece: &T, measurement: usize) -> usize;
@@ -33,8 +33,8 @@ pub trait Metric<T: RopePiece> {
     /// The default implementation approximates
     /// `to_base_units(from_base_units(base_offset) + delta_metric)`.
     /// But the implementer should override this method if they can optimize it further.
-    fn navigate(context: &T::Context, piece: &T, base_offset: usize, delta_metric: isize) -> Option<usize> {
-        let aligned = Self::from_base_units(context, piece, base_offset);
+    fn navigate(context: &T::Context, piece: &T, offset: &T::S, delta_metric: isize) -> Option<usize> {
+        let aligned = Self::from_base_units(context, piece, offset.len());
         if let Some(next) = aligned.checked_add_signed(delta_metric)
             && next <= Self::measure(&piece.summarize()) {
             Some(next)
@@ -97,11 +97,11 @@ pub struct CursorPos<T: Summable> {
     /// Reference to an actual node
     pub(crate) node: SafeRef,
     /// Offset in node *in base unit*
-    pub(crate) offset_in_node: usize,
+    pub(crate) offset_in_node: T::S,
     tree: PhantomData<T>,
 }
 impl<T: Summable> CursorPos<T> {
-    pub(crate) fn new(node: SafeRef, offset_in_node: usize) -> Self {
+    pub(crate) fn new(node: SafeRef, offset_in_node: T::S) -> Self {
         Self { node, offset_in_node, tree: PhantomData }
     }
 }
@@ -123,30 +123,29 @@ impl<T: RopePiece> CursorPos<T> {
         Cursor::new(tree, self)
     }
 
-    pub(crate) fn get_base_units<'a>(&self, tree: &'a RbSlab<T>) -> (&'a T, usize) {
+    pub(crate) fn get_offset<'a>(&self, tree: &'a RbSlab<T>) -> (&'a T, T::S) {
         let piece = &tree[self.node].piece;
         (piece, self.offset_in_node)
     }
 
-    fn rel_offset<M: Metric<T>>(&self, context: &T::Context, tree: &RbSlab<T>) -> usize {
-        let piece = &tree[self.node].piece;
-        M::from_base_units(context, piece, self.offset_in_node)
+    fn rel_offset<M: Metric<T>>(&self) -> usize {
+        M::measure(&self.offset_in_node)
     }
 
-    fn abs_offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
+    fn abs_offset(&self, tree: &RbSlab<T>) -> T::S {
         let mut node = self.node;
         let (mut offset, mut parent) = {
             let n = &tree[node];
             (
-                self.offset_in_node + M::measure(&tree[node].left_sum),
+                self.offset_in_node.add(&tree[node].left_sum),
                 n.rb.parent,
             )
         };
         while let Some(p) = parent {
             let pn = &tree[p];
             if pn.rb.children[1] == Some(node) {
-                offset += M::measure(&pn.left_sum);
-                offset += M::measure(&pn.piece.summarize());
+                offset.add_assign(&pn.left_sum);
+                offset.add_assign(&pn.piece.summarize());
             }
             node = p;
             parent = pn.rb.parent;
@@ -187,10 +186,10 @@ impl<T: RopePiece> CursorPos<T> {
         }
     }
     pub(crate) fn to_next_piece(&self, tree: &RbSlab<T>) -> Option<CursorPos<T>> {
-        tree.next(self.node, RIGHT).map(|next| CursorPos::new(next, 0))
+        tree.next(self.node, RIGHT).map(|next| CursorPos::new(next, T::S::identity()))
     }
     pub(crate) fn to_prev_piece(&self, tree: &RbSlab<T>) -> Option<CursorPos<T>> {
-        tree.next(self.node, LEFT).map(|next| CursorPos::new(next, 0))
+        tree.next(self.node, LEFT).map(|next| CursorPos::new(next, T::S::identity()))
     }
 }
 
@@ -217,13 +216,13 @@ impl<'a, T: RopePiece> Cursor<'a, T> {
 
     /// Returns the current piece and relative position of the cursor
     /// to the start of the current node in base units
-    pub fn get_base_units(&'a self) -> (&'a T, usize) {
-        self.pos.get_base_units(self.tree)
+    pub fn get_offset(&'a self) -> (&'a T, T::S) {
+        self.pos.get_offset(self.tree)
     }
 
-    /// Returns the current absolute offset in specific metric
-    pub fn abs_offset<M: Metric<T>>(&self) -> usize {
-        self.pos.abs_offset::<M>(self.tree)
+    /// Returns the current absolute offsets
+    pub fn abs_offset(&self) -> T::S {
+        self.pos.abs_offset(self.tree)
     }
 
     /// Move backwards `measurement` units
@@ -250,7 +249,7 @@ pub(crate) fn rel_node_at_metric<T: RopePiece, M: Metric<T>>(
     tree: &RbSlab<T>, context: &T::Context, mut x: Ref, mut offset: usize,
 ) -> Option<CursorPos<T>> {
     if let Some(x) = x && offset == 0 {
-        return Some(CursorPos::new(tree.edge(x, LEFT), 0));
+        return Some(CursorPos::new(tree.edge(x, LEFT), T::S::identity()));
     }
     while let Some(xi) = x {
         let n = &tree[xi];
@@ -264,7 +263,8 @@ pub(crate) fn rel_node_at_metric<T: RopePiece, M: Metric<T>>(
                 offset -= left_len;
                 debug_assert!((offset == 0) == (n_len == 0));
                 let base_offset = M::to_base_units(context, &n.piece, offset);
-                return Some(CursorPos::new(xi, M::to_base_units(context, &n.piece, base_offset)));
+                let offset = n.piece.measure_offset(context, base_offset);
+                return Some(CursorPos::new(xi, offset));
             } else {
                 offset -= pre_len;
                 x = n.rb.children[1];
@@ -280,18 +280,18 @@ pub(crate) fn rel_node_at<T: RopePiece, M: Metric<T>>(
     let x = from.node;
     let n = &tree[x];
     if dir == LEFT && let Some(next) = M::navigate(
-        context, &n.piece, from.offset_in_node, (metric_offset as isize).neg(),
+        context, &n.piece, &from.offset_in_node, (metric_offset as isize).neg(),
     ) && next != 0 {
-        return Some(CursorPos::new(x, next));
+        return Some(CursorPos::new(x, n.piece.measure_offset(context, next)));
     }
     if dir == RIGHT && let Some(next) = M::navigate(
-        context, &n.piece, from.offset_in_node, metric_offset as isize,
+        context, &n.piece, &from.offset_in_node, metric_offset as isize,
     ) {
-        return Some(CursorPos::new(x, next));
+        return Some(CursorPos::new(x, n.piece.measure_offset(context, next)));
     }
 
     let mut offset_i = M::measure(&n.left_sum) as isize
-        + from.rel_offset::<M>(context, tree) as isize
+        + from.rel_offset::<M>() as isize
         + if dir == LEFT { -(metric_offset as isize) } else { metric_offset as isize };
     let mut x = Some(x);
     while let Some(xi) = x {
@@ -313,7 +313,7 @@ pub(crate) fn rel_node_at<T: RopePiece, M: Metric<T>>(
         x = p;
     }
     if offset_i == 0 {
-        return Some(CursorPos::new(tree.edge(tree.root()?, LEFT), 0));
+        return Some(CursorPos::new(tree.edge(tree.root()?, LEFT), T::S::identity()));
     }
     None
 }
@@ -332,7 +332,7 @@ pub(crate) mod tests {
         };
         let mut c: Option<char> = None;
         loop {
-            let (s, offset) = cursor.get_base_units();
+            let (s, offset) = cursor.get_offset();
             assert_eq!(offset, 0);
             assert!(!s.is_empty());
             let next = s.c();
@@ -353,20 +353,20 @@ pub(crate) mod tests {
         let start = rb.cursor::<BaseMetric>(0);
         assert!(start.is_some());
         let start = start.unwrap();
-        assert_eq!(start.get_base_units().0, &"111".into());
-        assert_eq!(start.get_base_units().1, 0);
+        assert_eq!(start.get_offset().0, &"111".into());
+        assert_eq!(start.get_offset().1, 0);
 
         let mid = rb.cursor::<BaseMetric>(3);
         assert!(mid.is_some());
         let mid = mid.unwrap();
-        assert_eq!(mid.get_base_units().0, &"111".into());
-        assert_eq!(mid.get_base_units().1, 3);
+        assert_eq!(mid.get_offset().0, &"111".into());
+        assert_eq!(mid.get_offset().1, 3);
 
         let end = rb.cursor::<BaseMetric>(6);
         assert!(end.is_some());
         let end = end.unwrap();
-        assert_eq!(end.get_base_units().0, &"222".into());
-        assert_eq!(end.get_base_units().1, 3);
+        assert_eq!(end.get_offset().0, &"222".into());
+        assert_eq!(end.get_offset().1, 3);
 
         assert!(rb.cursor::<BaseMetric>(7).is_none());
     }
@@ -379,10 +379,10 @@ pub(crate) mod tests {
         }
         assert_eq!(26, rb.len());
         let mut start = rb.cursor::<BaseMetric>(0).unwrap();
-        let (piece, offset) = start.get_base_units();
+        let (piece, offset) = start.get_offset();
         assert_eq!(piece, &"a".into());
         assert_eq!(offset, 0);
-        assert_eq!(0, start.abs_offset::<BaseMetric>());
+        assert_eq!(0, start.abs_offset());
 
         struct Step {
             step: isize,
@@ -409,8 +409,8 @@ pub(crate) mod tests {
         for step in steps {
             abs = abs.checked_add_signed(step.step).unwrap();
             assert!(start.navigate::<BaseMetric>(&(), step.step));
-            assert_eq!(abs, start.abs_offset::<BaseMetric>());
-            let (piece, offset) = start.get_base_units();
+            assert_eq!(abs, start.abs_offset());
+            let (piece, offset) = start.get_offset();
             assert_eq!(offset, step.expected_offset);
             assert_eq!(piece, &step.expected_str.into());
         }

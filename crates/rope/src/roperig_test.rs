@@ -69,7 +69,8 @@ impl Summable for Alphabet {
 
 impl RopePiece for Alphabet {
     type Context = ();
-    fn insert_or_split(&mut self, _: &mut (), other: Insertion<Self>, offset: usize) -> SplitResult<Self> {
+    fn insert_or_split(&mut self, _: &mut (), other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
+        let offset = offset.len();
         let other = other.0;
         if self.is_empty() {
             *self = other;
@@ -99,11 +100,14 @@ impl RopePiece for Alphabet {
             SplitResult::MiddleSplit(other, Alphabet(self.c().unwrap(), tail))
         }
     }
-    fn delete_range(&mut self, _: &mut (), from: usize, to: usize) -> DeleteResult<Alphabet> {
+    fn delete_range(&mut self, _: &mut (), from: &usize, to: &usize) -> DeleteResult<Alphabet> {
         self.1 -= to - from;
         DeleteResult::Updated(to - from)
     }
     fn delete(&mut self, _: &mut ()) {
+    }
+    fn measure_offset(&self, _: &Self::Context, base_offset: usize) -> Self::S {
+        base_offset
     }
 }
 

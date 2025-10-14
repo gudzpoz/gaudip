@@ -100,7 +100,10 @@ const MAX_PIECE_LEN: usize = 256;
 impl RopePiece for TreePiece {
     type Context = Vec<TreeBuffer>;
 
-    fn insert_or_split(&mut self, context: &mut Self::Context, other: Insertion<Self>, offset: usize) -> SplitResult<Self> {
+    fn insert_or_split(
+        &mut self, context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S,
+    ) -> SplitResult<Self> {
+        let offset = offset.len();
         if offset == 0 {
             SplitResult::HeadSplit(other.0)
         } else if offset == self.len() {
@@ -118,7 +121,9 @@ impl RopePiece for TreePiece {
         }
     }
 
-    fn delete_range(&mut self, context: &mut Self::Context, from: usize, to: usize) -> DeleteResult<Self> {
+    fn delete_range(&mut self, context: &mut Self::Context, from: &Self::S, to: &Self::S) -> DeleteResult<Self> {
+        let from = from.len();
+        let to = to.len();
         if from == 0 {
             let remaining = self.split(context, to);
             let del = mem::replace(self, remaining);
@@ -142,6 +147,13 @@ impl RopePiece for TreePiece {
         if self.buffer_offset + self.len() == buffer.len() {
             buffer.truncate(self.buffer_offset);
         }
+    }
+
+    fn measure_offset(&self, context: &Self::Context, base_offset: usize) -> Self::S {
+        let buffer = &context[self.buffer].buffer;
+        TreeSum::summarize(
+            &buffer[self.buffer_offset..self.buffer_offset + base_offset],
+        )
     }
 }
 
