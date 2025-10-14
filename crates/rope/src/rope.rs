@@ -1,6 +1,7 @@
-use crate::metrics::{BaseMetric, Metric};
+use crate::metrics::{CharMetric, WithCharMetric};
 use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
+use crate::string::RopeContainer;
 
 /// A wrapper around a [String], with precalculated stats.
 pub struct StringExt<Ext: Sum + FromStr> {
@@ -75,18 +76,17 @@ impl<Ext: Sum + FromStr> Summable for StringExt<Ext> {
     }
 }
 
-struct CharMetric();
-impl<Ext: Sum + FromStr> Metric<StringExt<Ext>> for CharMetric {
-    fn measure(sum: &StringSum<Ext>) -> usize {
+impl<Ext: Sum + FromStr> WithCharMetric for StringExt<Ext> {
+    fn substring<F, R>(&self, _context: &Self::Context, start: usize, end: usize, mut f: F) -> R
+    where
+        F: FnMut(&str) -> R
+    {
+        let s = &self.s[start..end];
+        f(s)
+    }
+
+    fn chars(sum: &StringSum<Ext>) -> usize {
         sum.chars
-    }
-
-    fn from_base_units(piece: &StringExt<Ext>, base_units: usize) -> usize {
-        piece.s[..base_units].chars().count()
-    }
-
-    fn to_base_units(piece: &StringExt<Ext>, measurement: usize) -> usize {
-        piece.s.char_indices().nth(measurement).map(|(i, _)| i).unwrap_or(piece.s.len())
     }
 }
 
@@ -94,6 +94,15 @@ impl<Ext: Sum + FromStr> Metric<StringExt<Ext>> for CharMetric {
 pub struct StringRope<Ext: Sum + FromStr = ()>(Rope<StringExt<Ext>>);
 const MIN_PIECE_SIZE: usize = 128;
 const MAX_PIECE_SIZE: usize = 256;
+
+impl<Ext: Sum + FromStr> RopeContainer<StringExt<Ext>> for StringRope<Ext> {
+    fn rope(&self) -> &Rope<StringExt<Ext>> {
+        &self.0
+    }
+    fn rope_mut(&mut self) -> &mut Rope<StringExt<Ext>> {
+        &mut self.0
+    }
+}
 
 impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     type Context = ();
@@ -179,39 +188,14 @@ impl<Ext: Sum + FromStr> StringRope<Ext> {
     pub fn insert(&mut self, offset: usize, s: String) {
         self.0.insert(offset, s.to_string().into())
     }
-    /// Deletes a range of bytes
-    pub fn delete(&mut self, offset: usize, len: usize) {
-        self.0.delete(offset, len)
-    }
-    /// Returns a substring of the rope
-    pub fn substring(&self, from: usize, to: usize) -> String {
-        let mut gather = String::with_capacity(to - from);
-        self.0.for_range::<BaseMetric>(from..to, |_, s, range| {
-            gather.push_str(&s.s[range]);
-            true
-        });
-        gather
-    }
-    /// Converts a char offset to a byte offset
-    pub fn char_to_byte(&self, offset: usize) -> usize {
-        self.0.cursor::<CharMetric>(offset)
-            .map(|c| c.abs_offset::<BaseMetric>())
-            .unwrap_or(self.len())
-    }
-    /// Converts a byte offset to a char offset
-    pub fn byte_to_char(&self, offset: usize) -> usize {
-        self.0.cursor::<BaseMetric>(offset)
-            .map(|c| c.abs_offset::<CharMetric>())
-            .unwrap_or(self.len())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-    use rand_chacha::ChaCha8Rng;
-    use rand_chacha::rand_core::SeedableRng;
     use super::*;
+    use rand::Rng;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
     fn test_random() {
@@ -223,7 +207,7 @@ mod tests {
                 let from = next_char_boundary(&expected, rng.random_range(0..=expected.len()));
                 let to = next_char_boundary(&expected, rng.random_range(from..=expected.len()));
                 expected.drain(from..to);
-                rope.delete(from, to - from);
+                rope.delete_bytes(from..to);
             } else {
                 let offset = next_char_boundary(&expected, rng.random_range(0..=expected.len()));
                 let len = rng.random_range(0..100);
@@ -245,7 +229,7 @@ mod tests {
             assert_eq!(start_chars, rope.byte_to_char(start));
             assert_eq!(start, rope.char_to_byte(start_chars));
             let end = next_char_boundary(&expected, end);
-            assert_eq!(&expected[start..end], rope.substring(start, end));
+            assert_eq!(&expected[start..end], rope.substring(start..end));
         }
     }
 

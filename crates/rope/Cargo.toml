@@ -2,12 +2,16 @@
 name = "roperig"
 license = "MIT"
 version = "0.1.0"
-authors = ["Sevag Hanssian <sevag.hanssian@gmail.com>"]
+authors = [
+    "gudzpoz <gudzpoz@live.com>",
+    "Sevag Hanssian <sevag.hanssian@gmail.com>",
+]
 edition.workspace = true
 
 [features]
-default = ["rope"]
+default = ["rope", "piece-tree"]
 rope = []
+piece-tree = []
 
 [dependencies]
 slab = { workspace = true }

@@ -11,10 +11,15 @@ pub mod metrics;
 pub mod piece;
 /// The rope implementation.
 pub mod roperig;
+/// Utility methods for string-like rope containers
+pub mod string;
 
 /// Contains a [String] rope implementation based on [roperig].
 #[cfg(feature = "rope")]
 pub mod rope;
+/// Contains a [String] piece tree implementation based on [roperig].
+#[cfg(feature = "piece-tree")]
+pub mod piece_tree;
 
 /// Contains a basic red-black tree implementation based on slab.
 mod rb_base;

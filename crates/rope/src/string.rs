@@ -1,0 +1,83 @@
+use std::ops::Range;
+use crate::metrics::{BaseMetric, CharMetric, WithCharMetric};
+use crate::piece::RopePiece;
+use crate::roperig::Rope;
+
+/// A utility trait for types that contain a rope
+/// 
+/// It contains some convenience methods for string-like ropes.
+pub trait RopeContainer<T: RopePiece + WithCharMetric> {
+    /// Returns a reference to the contained rope
+    fn rope(&self) -> &Rope<T>;
+    
+    /// Returns a mutable reference to the contained rope
+    fn rope_mut(&mut self) -> &mut Rope<T>;
+
+    /// Returns the length of the tree, in bytes
+    fn len(&self) -> usize {
+        self.rope().len()
+    }
+
+    /// Returns true if the tree is empty
+    fn is_empty(&self) -> bool {
+        self.rope().is_empty()
+    }
+
+    /// Returns the length of the tree, in characters
+    fn char_len(&self) -> usize {
+        self.rope().measure::<CharMetric>()
+    }
+
+    /// Returns a substring of the rope
+    fn substring(&self, range: Range<usize>) -> String {
+        self.rope().substring(range)
+    }
+    
+    /// Appends the substring of the rope into `buffer`
+    fn substring_store(&self, range: Range<usize>, buffer: &mut String) {
+        self.rope().substring_store(range, buffer)
+    }
+
+    /// Converts a char offset to a byte offset
+    fn char_to_byte(&self, offset: usize) -> usize {
+        self.rope().char_to_byte(offset)
+    }
+
+    /// Converts a byte offset to a char offset
+    fn byte_to_char(&self, offset: usize) -> usize {
+        self.rope().byte_to_char(offset)
+    }
+    
+    /// Deletes a range of bytes
+    fn delete_bytes(&mut self, range: Range<usize>) {
+        self.rope_mut().delete(range)
+    }
+}
+
+impl<T: RopePiece + WithCharMetric> Rope<T> {
+    /// Returns a substring of the rope
+    pub fn substring_store(&self, range: Range<usize>, out: &mut String) {
+        self.for_range::<BaseMetric>(range, |ctx, s, range| {
+            s.substring(ctx, range.start, range.end, |sub| out.push_str(sub));
+            true
+        });
+    }
+    /// Returns a substring of the rope
+    pub fn substring(&self, range: Range<usize>) -> String {
+        let mut gather = String::with_capacity(range.len());
+        self.substring_store(range, &mut gather);
+        gather
+    }
+    /// Converts a char offset to a byte offset
+    pub fn char_to_byte(&self, offset: usize) -> usize {
+        self.cursor::<CharMetric>(offset)
+            .map(|c| c.abs_offset::<BaseMetric>())
+            .unwrap_or(self.len())
+    }
+    /// Converts a byte offset to a char offset
+    pub fn byte_to_char(&self, offset: usize) -> usize {
+        self.cursor::<BaseMetric>(offset)
+            .map(|c| c.abs_offset::<CharMetric>())
+            .unwrap_or(self.len())
+    }
+}

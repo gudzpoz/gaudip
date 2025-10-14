@@ -146,23 +146,23 @@ impl<T: RopePiece> Rope<T> {
     }
 
     /// Delete a substring (or sub-rope?) from the rope
-    pub fn delete(&mut self, offset: usize, len: usize) {
-        if len == 0 {
+    pub fn delete(&mut self, range: Range<usize>) {
+        if range.is_empty() {
             return;
         }
-        if let Some(pos) = self.node_at_metric::<BaseMetric>(offset) {
-            pos.delete_len(self, len);
+        if let Some(pos) = self.node_at_metric::<BaseMetric>(range.start) {
+            pos.delete_len(self, range.len());
         }
     }
 
     /// Similar to [Self::delete], but it tries to merge the adjacent nodes after deletion
-    pub fn delete_merging(&mut self, offset: usize, len: usize, mergeable: impl Fn(&T, &T) -> bool) {
-        if len == 0 || (offset == 0 && len == self.sum.len()) {
-            self.delete(offset, len);
+    pub fn delete_merging(&mut self, range: Range<usize>, mergeable: impl Fn(&T, &T) -> bool) {
+        if range.is_empty() || (range.start == 0 && range.len() == self.sum.len()) {
+            self.delete(range);
             return;
         }
-        if let Some(pos) = self.node_at_metric::<BaseMetric>(offset) {
-            pos.delete_len_merging(self, len, mergeable);
+        if let Some(pos) = self.node_at_metric::<BaseMetric>(range.start) {
+            pos.delete_len_merging(self, range.len(), mergeable);
         }
     }
 
@@ -191,16 +191,18 @@ impl<T: RopePiece> Rope<T> {
     }
 
     pub(crate) fn node_at_metric<M: Metric<T>>(&self, offset: usize) -> Option<CursorPos<T>> {
-        Self::tree_node_at_metric::<M>(&self.tree, offset)
+        Self::tree_node_at_metric::<M>(&self.tree, &self.context, offset)
     }
-    fn tree_node_at_metric<M: Metric<T>>(tree: &RbSlab<T>, offset: usize) -> Option<CursorPos<T>> {
+    fn tree_node_at_metric<M: Metric<T>>(
+        tree: &RbSlab<T>, context: &T::Context, offset: usize,
+    ) -> Option<CursorPos<T>> {
         let x = tree.root();
         if offset == 0 {
             let mut x = x?;
             x = tree.edge(x, LEFT);
             Some(CursorPos::new(x, 0))
         } else {
-            rel_node_at_metric::<T, M>(tree, x, offset)
+            rel_node_at_metric::<T, M>(tree, context, x, offset)
         }
     }
 
@@ -220,7 +222,7 @@ impl<T: RopePiece> Rope<T> {
         let Some(start) = self.cursor::<M>(range.start) else { return };
         let start = start.inner();
         let mut end = start.clone();
-        let end = if end.navigate::<BaseMetric>(&self.tree, range.len() as isize) {
+        let end = if end.navigate::<BaseMetric>(&self.tree, &self.context, range.len() as isize) {
             end
         } else {
             let node = self.tree.edge(self.tree.root().unwrap(), RIGHT);
@@ -457,7 +459,7 @@ impl<T: RopePiece> CursorPos<T> {
         }
         let start = self;
         let mut end = start.clone();
-        let end = if end.navigate::<BaseMetric>(&rope.tree, len as isize) {
+        let end = if end.navigate::<BaseMetric>(&rope.tree, &rope.context, len as isize) {
             end
         } else if let Some(root) = rope.tree.root() {
             let end = rope.tree.edge(root, RIGHT);
@@ -687,7 +689,7 @@ mod tests {
         fn assert_merge(ops: &[(&str, usize, usize)], result: &[Option<&str>]) {
             let mut rope: Rope<Alphabet> = Rope::default();
             for (inserted, offset, deletes) in ops {
-                rope.delete_merging(*offset, *deletes, |a, b| {
+                rope.delete_merging(*offset..*offset + *deletes, |a, b| {
                     a.is_mergeable(b)
                 });
                 rope.insert_merging(*offset, (*inserted).into());
@@ -858,7 +860,7 @@ mod tests {
         rb.insert(0, "111".into());
         rb.insert(3, "222".into());
         rb.insert(6, "333".into());
-        rb.delete(0, 9);
+        rb.delete(0..9);
         rb.is_valid();
         assert_eq!("", gather(&rb));
         assert_eq!(0, rb.sum);
@@ -882,7 +884,7 @@ mod tests {
             assert_eq!(expected, gather(&rb));
             let from = rng.random_range(0..=(expected.len()/2));
             let to = rng.random_range((expected.len()/2)..=expected.len());
-            rb.delete_merging(from, to - from, |a, b| a.is_mergeable(b));
+            rb.delete_merging(from..to, |a, b| a.is_mergeable(b));
             expected.drain(from..to);
             assert_eq!(expected.len(), rb.len(), "{}: from: {}, to: {}", i, from, to);
             assert_eq!(expected, gather(&rb));
@@ -948,7 +950,7 @@ mod tests {
         assert_alpha_off(&rb, 5, 0);
         
         let delete_merging = |rb: &mut Rope<Alphabet>, from: usize, len: usize| {
-            rb.delete_merging(from, len, |a, b| {
+            rb.delete_merging(from..from + len, |a, b| {
                 a.is_mergeable(b)
             });
         };

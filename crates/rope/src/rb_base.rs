@@ -131,6 +131,7 @@ impl<T: Summable> RbSlab<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn compact<F>(&mut self, mut f: F)
     where F: FnMut(&mut T, TransientRef, TransientRef) -> bool {
         // TODO: this is unexposed API because it's bad...
@@ -532,7 +533,7 @@ impl<T: Summable> RbSlab<T> {
     }
 
     pub fn fix_insert(&mut self, mut z: Ref) {
-        self.recompute_sum(z);
+        self.recompute_sum(z); // TODO: can this be done through a delta?
 
         let mut p = self[z].parent;
 

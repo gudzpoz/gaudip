@@ -1,4 +1,4 @@
-use crate::piece::{Sum, Summable};
+use crate::piece::{RopePiece, Sum, Summable};
 use crate::rb_base::{RbSlab, Ref, SafeRef, LEFT, RIGHT};
 use std::marker::PhantomData;
 use std::ops::Neg;
@@ -12,16 +12,16 @@ use std::ops::Neg;
 /// ## Base Metric
 ///
 /// We provide a [BaseMetric] as the metric in base units of the rope.
-pub trait Metric<T: Summable> {
+pub trait Metric<T: RopePiece> {
     /// Returns the measurement of a [Sum]
     fn measure(sum: &T::S) -> usize;
     /// Converts from base units (as is returned by [Sum::len]) to this measurement
     ///
     /// This should truncate to the nearest previous metric unit boundary.
-    fn from_base_units(piece: &T, base_units: usize) -> usize;
+    fn from_base_units(context: &T::Context,piece: &T, base_units: usize) -> usize;
     /// Converts from this measurement to base units (as is returned by [Sum::len])
     #[allow(clippy::wrong_self_convention)]
-    fn to_base_units(piece: &T, measurement: usize) -> usize;
+    fn to_base_units(context: &T::Context, piece: &T, measurement: usize) -> usize;
     /// Returns the base offset of when moving from `base_offset` by
     /// `delta_metric` metric units.
     ///
@@ -33,8 +33,8 @@ pub trait Metric<T: Summable> {
     /// The default implementation approximates
     /// `to_base_units(from_base_units(base_offset) + delta_metric)`.
     /// But the implementer should override this method if they can optimize it further.
-    fn navigate(piece: &T, base_offset: usize, delta_metric: isize) -> Option<usize> {
-        let aligned = Self::from_base_units(piece, base_offset);
+    fn navigate(context: &T::Context, piece: &T, base_offset: usize, delta_metric: isize) -> Option<usize> {
+        let aligned = Self::from_base_units(context, piece, base_offset);
         if let Some(next) = aligned.checked_add_signed(delta_metric)
             && next <= Self::measure(&piece.summarize()) {
             Some(next)
@@ -47,15 +47,45 @@ pub trait Metric<T: Summable> {
 /// The base metric measured by [Sum::len]
 pub struct BaseMetric();
 
-impl<T: Summable> Metric<T> for BaseMetric {
+impl<T: RopePiece> Metric<T> for BaseMetric {
     fn measure(sum: &T::S) -> usize {
         sum.len()
     }
-    fn from_base_units(_piece: &T, base_units: usize) -> usize {
+    fn from_base_units(_: &T::Context, _piece: &T, base_units: usize) -> usize {
         base_units
     }
-    fn to_base_units(_piece: &T, measurement: usize) -> usize {
+    fn to_base_units(_: &T::Context, _piece: &T, measurement: usize) -> usize {
         measurement
+    }
+}
+
+/// Basic methods to allow automatic implementation of [CharMetric]
+pub trait WithCharMetric: RopePiece {
+    /// Returns a substring of the piece
+    fn substring<F, R>(
+        &self, context: &Self::Context, start: usize, end: usize,
+        f: F,
+    ) -> R where F: FnMut(&str) -> R;
+    /// Returns the number of characters in the piece
+    fn chars(sum: &Self::S) -> usize;
+}
+
+/// Char count metric, for type implementing [WithCharMetric]
+pub struct CharMetric();
+impl<T: WithCharMetric> Metric<T> for CharMetric {
+    fn measure(sum: &T::S) -> usize {
+        T::chars(sum)
+    }
+
+    fn from_base_units(context: &T::Context, piece: &T, base_units: usize) -> usize {
+        piece.substring(context, 0, base_units, |s| s.chars().count())
+    }
+
+    fn to_base_units(context: &T::Context, piece: &T, measurement: usize) -> usize {
+        piece.substring(context, 0, piece.len(), |s| {
+            s.char_indices()
+                .nth(measurement).map(|(i, _)| i).unwrap_or(piece.len())
+        })
     }
 }
 
@@ -87,7 +117,7 @@ impl<T: Summable> Clone for CursorPos<T> {
 }
 
 // See [Cursor] for documentation.
-impl<T: Summable> CursorPos<T> {
+impl<T: RopePiece> CursorPos<T> {
     /// Converts to an immutable cursor
     pub(crate) fn cursor(self, tree: &RbSlab<T>) -> Cursor<'_, T> {
         Cursor::new(tree, self)
@@ -98,9 +128,9 @@ impl<T: Summable> CursorPos<T> {
         (piece, self.offset_in_node)
     }
 
-    fn rel_offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
+    fn rel_offset<M: Metric<T>>(&self, context: &T::Context, tree: &RbSlab<T>) -> usize {
         let piece = &tree[self.node].piece;
-        M::from_base_units(piece, self.offset_in_node)
+        M::from_base_units(context, piece, self.offset_in_node)
     }
 
     fn abs_offset<M: Metric<T>>(&self, tree: &RbSlab<T>) -> usize {
@@ -124,14 +154,14 @@ impl<T: Summable> CursorPos<T> {
         offset
     }
 
-    pub(crate) fn navigate<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: isize) -> bool {
+    pub(crate) fn navigate<M: Metric<T>>(&mut self, tree: &RbSlab<T>, context: &T::Context, measurement: isize) -> bool {
         self.move_towards::<M>(
-            tree, measurement.unsigned_abs(),
+            tree, context, measurement.unsigned_abs(),
             if measurement < 0 { LEFT } else { RIGHT },
         )
     }
-    fn move_towards<M: Metric<T>>(&mut self, tree: &RbSlab<T>, measurement: usize, dir: usize) -> bool {
-        let next = rel_node_at::<T, M>(tree, self.clone(), measurement, dir);
+    fn move_towards<M: Metric<T>>(&mut self, tree: &RbSlab<T>, context: &T::Context, measurement: usize, dir: usize) -> bool {
+        let next = rel_node_at::<T, M>(tree, context, self.clone(), measurement, dir);
         if let Some(next) = next {
             *self = next;
             true
@@ -174,7 +204,7 @@ pub struct Cursor<'a, T: Summable> {
     pos: CursorPos<T>,
 }
 
-impl<'a, T: Summable> Cursor<'a, T> {
+impl<'a, T: RopePiece> Cursor<'a, T> {
     pub(crate) fn new(tree: &'a RbSlab<T>, pos: CursorPos<T>) -> Self {
         Self { tree, pos }
     }
@@ -185,12 +215,6 @@ impl<'a, T: Summable> Cursor<'a, T> {
         self.pos.clone()
     }
 
-    /// Returns the current piece and relative position of the cursor
-    /// to the start of the current node in base units
-    pub fn get<M: Metric<T>>(&'a self) -> (&'a T, usize) {
-        let (piece, base) = self.pos.get_base_units(self.tree);
-        (piece, M::from_base_units(piece, base))
-    }
     /// Returns the current piece and relative position of the cursor
     /// to the start of the current node in base units
     pub fn get_base_units(&'a self) -> (&'a T, usize) {
@@ -204,8 +228,8 @@ impl<'a, T: Summable> Cursor<'a, T> {
 
     /// Move backwards `measurement` units
     /// Move forwards `measurement` units
-    pub fn navigate<M: Metric<T>>(&mut self, measurement: isize) -> bool {
-        self.pos.navigate::<M>(self.tree, measurement)
+    pub fn navigate<M: Metric<T>>(&mut self, context: &T::Context, measurement: isize) -> bool {
+        self.pos.navigate::<M>(self.tree, context, measurement)
     }
 
     /// Move the cursor to the next consecutive piece
@@ -222,8 +246,8 @@ impl<'a, T: Summable> Cursor<'a, T> {
     }
 }
 
-pub(crate) fn rel_node_at_metric<T: Summable, M: Metric<T>>(
-    tree: &RbSlab<T>, mut x: Ref, mut offset: usize,
+pub(crate) fn rel_node_at_metric<T: RopePiece, M: Metric<T>>(
+    tree: &RbSlab<T>, context: &T::Context, mut x: Ref, mut offset: usize,
 ) -> Option<CursorPos<T>> {
     if let Some(x) = x && offset == 0 {
         return Some(CursorPos::new(tree.edge(x, LEFT), 0));
@@ -239,8 +263,8 @@ pub(crate) fn rel_node_at_metric<T: Summable, M: Metric<T>>(
             if pre_len >= offset {
                 offset -= left_len;
                 debug_assert!((offset == 0) == (n_len == 0));
-                let base_offset = M::to_base_units(&n.piece, offset);
-                return Some(CursorPos::new(xi, M::to_base_units(&n.piece, base_offset)));
+                let base_offset = M::to_base_units(context, &n.piece, offset);
+                return Some(CursorPos::new(xi, M::to_base_units(context, &n.piece, base_offset)));
             } else {
                 offset -= pre_len;
                 x = n.rb.children[1];
@@ -250,30 +274,30 @@ pub(crate) fn rel_node_at_metric<T: Summable, M: Metric<T>>(
     None
 }
 
-pub(crate) fn rel_node_at<T: Summable, M: Metric<T>>(
-    tree: &RbSlab<T>, from: CursorPos<T>, metric_offset: usize, dir: usize,
+pub(crate) fn rel_node_at<T: RopePiece, M: Metric<T>>(
+    tree: &RbSlab<T>, context: &T::Context, from: CursorPos<T>, metric_offset: usize, dir: usize,
 ) -> Option<CursorPos<T>> {
     let x = from.node;
     let n = &tree[x];
     if dir == LEFT && let Some(next) = M::navigate(
-        &n.piece, from.offset_in_node, (metric_offset as isize).neg(),
+        context, &n.piece, from.offset_in_node, (metric_offset as isize).neg(),
     ) && next != 0 {
         return Some(CursorPos::new(x, next));
     }
     if dir == RIGHT && let Some(next) = M::navigate(
-        &n.piece, from.offset_in_node, metric_offset as isize,
+        context, &n.piece, from.offset_in_node, metric_offset as isize,
     ) {
         return Some(CursorPos::new(x, next));
     }
 
     let mut offset_i = M::measure(&n.left_sum) as isize
-        + from.rel_offset::<M>(tree) as isize
+        + from.rel_offset::<M>(context, tree) as isize
         + if dir == LEFT { -(metric_offset as isize) } else { metric_offset as isize };
     let mut x = Some(x);
     while let Some(xi) = x {
         let n = &tree[xi];
         if 0 < offset_i {
-            let subtree = rel_node_at_metric::<T, M>(tree, x, offset_i as usize);
+            let subtree = rel_node_at_metric::<T, M>(tree, context, x, offset_i as usize);
             if subtree.is_some() {
                 return subtree;
             }
@@ -384,7 +408,7 @@ pub(crate) mod tests {
         let mut abs = 0usize;
         for step in steps {
             abs = abs.checked_add_signed(step.step).unwrap();
-            assert!(start.navigate::<BaseMetric>(step.step));
+            assert!(start.navigate::<BaseMetric>(&(), step.step));
             assert_eq!(abs, start.abs_offset::<BaseMetric>());
             let (piece, offset) = start.get_base_units();
             assert_eq!(offset, step.expected_offset);
