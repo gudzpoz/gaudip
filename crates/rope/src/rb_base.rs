@@ -75,6 +75,13 @@ pub(crate) struct RbSlab<T: Summable> {
     slab: Slab<Node<T>>,
     root: Ref,
 }
+impl<T: Summable> Drop for RbSlab<T> {
+    fn drop(&mut self) {
+        let sentinel = self.slab.remove(0);
+        // Sentinel piece is uninitialized, dropping is unsafe.
+        std::mem::forget(sentinel.piece);
+    }
+}
 impl<T: Summable> RbSlab<T> {
     pub fn new() -> Self {
         let mut slab = Slab::default();

@@ -41,7 +41,7 @@
 
 // See crates/rope/LICENSE for more license information.
 
-use crate::metrics::{rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
+use crate::metrics::{abs_node_offset, rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
 use crate::piece::{DeleteResult, Insertion, Measured, RopePiece, SplitResult, Sum};
 use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT, SENTINEL};
 use std::collections::VecDeque;
@@ -217,7 +217,7 @@ impl<T: RopePiece> Rope<T> {
     /// Iterate over the rope within the range
     pub fn for_range<M: Metric<T>>(
         &self, range: Range<usize>,
-        mut f: impl FnMut(&T::Context, &T, Range<T::S>) -> bool,
+        mut f: impl FnMut(&T::Context, &T, Range<T::S>, usize) -> bool,
     ) {
         let Some(start) = self.cursor::<M>(range.start) else { return };
         let start = start.inner();
@@ -230,6 +230,7 @@ impl<T: RopePiece> Rope<T> {
         };
 
         let mut i = Some(start.node);
+        let mut abs = if T::ABS { abs_node_offset(&self.tree, Some(start.node)) } else { 0 };
         while let Some(idx) = i {
             let offset = if idx == start.node {
                 start.offset_in_node
@@ -242,11 +243,14 @@ impl<T: RopePiece> Rope<T> {
             } else {
                 piece.summarize()
             };
-            if !f(&self.context, piece, offset..end_off) {
+            if !f(&self.context, piece, offset..end_off, abs) {
                 break;
             }
             if idx == end.node {
                 break;
+            }
+            if T::ABS {
+                abs += end_off.len() - offset.len();
             }
             i = self.tree.next(idx, RIGHT);
         }
@@ -362,12 +366,18 @@ impl<T: RopePiece> Rope<T> {
 
 impl<T: RopePiece> CursorPos<T> {
     /// Get necessary information to get value from the piece
-    pub fn get<'a>(&self, rope: &'a Rope<T>) -> (&'a T, T::S, &'a T::Context) {
-        (&rope.tree[self.node].piece, self.offset_in_node, &rope.context)
+    ///
+    /// Returns `(&piece, rel_offset, abs_offset, &context)`.
+    pub fn get<'a>(&self, rope: &'a Rope<T>) -> (&'a T, T::S, usize, &'a T::Context) {
+        let abs_start = if T::ABS { abs_node_offset(&rope.tree, Some(self.node)) } else { 0 };
+        (&rope.tree[self.node].piece, self.offset_in_node, abs_start, &rope.context)
     }
     /// Get necessary information to mutate value from the piece
-    pub fn get_mut<'a>(&self, rope: &'a mut Rope<T>) -> (&'a mut T, T::S, &'a mut T::Context) {
-        (&mut rope.tree[self.node].piece, self.offset_in_node, &mut rope.context)
+    ///
+    /// Returns `(&mut piece, rel_offset, abs_offset, &mut context)`.
+    pub fn get_mut<'a>(&self, rope: &'a mut Rope<T>) -> (&'a mut T, T::S, usize, &'a mut T::Context) {
+        let abs_start = if T::ABS { abs_node_offset(&rope.tree, Some(self.node)) } else { 0 };
+        (&mut rope.tree[self.node].piece, self.offset_in_node, abs_start, &mut rope.context)
     }
 
     /// Inserts a new piece as a new node to the left of the current node

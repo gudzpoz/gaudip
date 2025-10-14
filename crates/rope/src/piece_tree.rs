@@ -3,6 +3,7 @@ use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summabl
 use crate::roperig::Rope;
 use crate::string::RopeContainer;
 use std::mem;
+use std::ops::Range;
 
 #[derive(Default)]
 struct TreeBuffer {
@@ -66,13 +67,13 @@ impl Summable for TreePiece {
     }
 }
 impl WithCharMetric for TreePiece {
-    fn substring<F, R>(&self, ctx: &Self::Context, start: usize, end: usize, mut f: F) -> R
+    fn substring<F, R: Default>(&self, ctx: &Self::Context, range: Range<usize>, _abs: usize, mut f: F) -> R
     where
-        F: FnMut(&str) -> R
+        F: FnMut(&str, R) -> R
     {
         let s = &ctx[self.buffer]
-            .buffer[self.buffer_offset + start..self.buffer_offset + end];
-        f(s)
+            .buffer[self.buffer_offset + range.start..self.buffer_offset + range.end];
+        f(s, R::default())
     }
 
     fn chars(sum: &TreeSum) -> usize {
@@ -99,6 +100,7 @@ const MAX_PIECE_LEN: usize = 256;
 
 impl RopePiece for TreePiece {
     type Context = Vec<TreeBuffer>;
+    const ABS: bool = false;
 
     fn insert_or_split(
         &mut self, context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S,
@@ -149,7 +151,7 @@ impl RopePiece for TreePiece {
         }
     }
 
-    fn measure_offset(&self, context: &Self::Context, base_offset: usize) -> Self::S {
+    fn measure_offset(&self, context: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
         let buffer = &context[self.buffer].buffer;
         TreeSum::summarize(
             &buffer[self.buffer_offset..self.buffer_offset + base_offset],

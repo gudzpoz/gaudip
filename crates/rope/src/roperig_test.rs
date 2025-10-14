@@ -69,6 +69,7 @@ impl Summable for Alphabet {
 
 impl RopePiece for Alphabet {
     type Context = ();
+    const ABS: bool = false;
     fn insert_or_split(&mut self, _: &mut (), other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
         let offset = offset.len();
         let other = other.0;
@@ -106,7 +107,7 @@ impl RopePiece for Alphabet {
     }
     fn delete(&mut self, _: &mut ()) {
     }
-    fn measure_offset(&self, _: &Self::Context, base_offset: usize) -> Self::S {
+    fn measure_offset(&self, _: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
         base_offset
     }
 }
@@ -115,7 +116,7 @@ impl Rope<Alphabet> {
     /// Utility function for testing: to string
     pub fn substring(&self, start: usize, end: usize) -> String {
         let mut s = String::with_capacity(end - start);
-        self.for_range::<BaseMetric>(start..end, |_, piece, range| {
+        self.for_range::<BaseMetric>(start..end, |_, piece, range, _| {
             if !range.is_empty() {
                 s.push_str(&piece.c().unwrap().to_string().repeat(range.len()));
             }

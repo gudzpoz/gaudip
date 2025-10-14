@@ -51,6 +51,7 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
 }
 /// A simple trait to avoid generic brackets
 pub trait Measured<T: RopePiece> {
+    /// Returns the measurement in [Metric]
     fn get<M: Metric<T>>(&self) -> usize;
 }
 impl<T: RopePiece> Measured<T> for T::S {
@@ -111,6 +112,14 @@ pub enum DeleteResult<T: RopePiece> {
 /// If the user wishes for a more flexible API (for, for example, expressing
 /// mergeability, zero-width nodes, etc.), they are expected to use the [Cursor]
 /// API instead.
+///
+/// The `ABS` parameter is used to indicate whether the [Self::measure_offset]
+/// function should be passed an additional absolute offset. If `false`, `0` is
+/// passed as the argument.
+///
+/// TODO: The `ABS` parameter currently makes the rope computes absolute offsets
+///       on the fly. Instead, we might want to cache them or allow the user to
+///       supply an externally kept one. This is mainly for gap buffers.
 pub trait RopePiece: Summable + Sized {
     /// Context object for rope pieces
     ///
@@ -123,6 +132,10 @@ pub trait RopePiece: Summable + Sized {
     ///
     /// [piece tree]: https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
     type Context;
+    /// Whether the API should pass absolute offsets as an additional argument.
+    ///
+    /// For example, gap buffer implementations might need this.
+    const ABS: bool;
 
     /// Try to insert a new piece into the current piece
     ///
@@ -144,7 +157,12 @@ pub trait RopePiece: Summable + Sized {
     fn delete(&mut self, context: &mut Self::Context);
 
     /// Returns the relative metrics at the given offset
-    fn measure_offset(&self, context: &Self::Context, base_offset: usize) -> Self::S;
+    ///
+    /// Note that `abs_base_offset` is always zero unless `Abs` is true.
+    fn measure_offset(
+        &self, context: &Self::Context,
+        base_offset: usize, abs_base_offset: usize,
+    ) -> Self::S;
 }
 /// A piece, typically to be inserted, with its [Sum] precomputed
 pub struct Insertion<T: RopePiece>(pub T, pub T::S);

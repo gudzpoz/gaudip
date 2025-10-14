@@ -2,6 +2,7 @@
 //! and piece trees.
 //!
 //! To use it, implement the [piece::RopePiece] trait and use [roperig::Rope].
+#![doc = include_str!("../README.md")]
 
 #![warn(missing_docs)]
 
@@ -20,6 +21,9 @@ pub mod rope;
 /// Contains a [String] piece tree implementation based on [roperig].
 #[cfg(feature = "piece-tree")]
 pub mod piece_tree;
+/// Contains a [String] gap buffer implementation based on [roperig].
+#[cfg(feature = "gap-buffer")]
+pub mod gap_buffer;
 
 /// Contains a basic red-black tree implementation based on slab.
 mod rb_base;

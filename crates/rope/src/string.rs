@@ -30,12 +30,17 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 
     /// Returns a substring of the rope
     fn substring(&self, range: Range<usize>) -> String {
-        self.rope().substring(range)
+        let mut gather = String::with_capacity(range.len());
+        self.substring_store(range, &mut gather);
+        gather
     }
 
     /// Appends the substring of the rope into `buffer`
     fn substring_store(&self, range: Range<usize>, buffer: &mut String) {
-        self.rope().substring_store(range, buffer)
+        self.rope().for_range::<BaseMetric>(range, |ctx, s, range, abs| {
+            s.substring(ctx, range.start.len()..range.end.len(), abs, |sub, _| buffer.push_str(sub));
+            true
+        });
     }
 
     /// Converts a char offset to a byte offset
@@ -55,19 +60,6 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 }
 
 impl<T: RopePiece + WithCharMetric> Rope<T> {
-    /// Returns a substring of the rope
-    pub fn substring_store(&self, range: Range<usize>, out: &mut String) {
-        self.for_range::<BaseMetric>(range, |ctx, s, range| {
-            s.substring(ctx, range.start.len(), range.end.len(), |sub| out.push_str(sub));
-            true
-        });
-    }
-    /// Returns a substring of the rope
-    pub fn substring(&self, range: Range<usize>) -> String {
-        let mut gather = String::with_capacity(range.len());
-        self.substring_store(range, &mut gather);
-        gather
-    }
     /// Converts a char offset to a byte offset
     pub fn char_to_byte(&self, offset: usize) -> usize {
         self.cursor::<CharMetric>(offset)

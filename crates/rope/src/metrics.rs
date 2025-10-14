@@ -1,7 +1,7 @@
 use crate::piece::{RopePiece, Sum, Summable};
 use crate::rb_base::{RbSlab, Ref, SafeRef, LEFT, RIGHT};
 use std::marker::PhantomData;
-use std::ops::Neg;
+use std::ops::{Neg, Range};
 
 /// A metric system for rope pieces
 ///
@@ -18,10 +18,16 @@ pub trait Metric<T: RopePiece> {
     /// Converts from base units (as is returned by [Sum::len]) to this measurement
     ///
     /// This should truncate to the nearest previous metric unit boundary.
-    fn from_base_units(context: &T::Context, piece: &T, base_units: usize) -> usize;
+    fn from_base_units(
+        context: &T::Context, piece: &T,
+        base_units: usize, abs_base_start: usize,
+    ) -> usize;
     /// Converts from this measurement to base units (as is returned by [Sum::len])
     #[allow(clippy::wrong_self_convention)]
-    fn to_base_units(context: &T::Context, piece: &T, measurement: usize) -> usize;
+    fn to_base_units(
+        context: &T::Context, piece: &T,
+        measurement: usize, abs_base_start: usize,
+    ) -> usize;
     /// Returns the base offset of when moving from `base_offset` by
     /// `delta_metric` metric units.
     ///
@@ -33,8 +39,11 @@ pub trait Metric<T: RopePiece> {
     /// The default implementation approximates
     /// `to_base_units(from_base_units(base_offset) + delta_metric)`.
     /// But the implementer should override this method if they can optimize it further.
-    fn navigate(context: &T::Context, piece: &T, offset: &T::S, delta_metric: isize) -> Option<usize> {
-        let aligned = Self::from_base_units(context, piece, offset.len());
+    fn navigate(
+        context: &T::Context, piece: &T, offset: &T::S,
+        delta_metric: isize, abs_base_start: usize,
+    ) -> Option<usize> {
+        let aligned = Self::from_base_units(context, piece, offset.len(), abs_base_start);
         if let Some(next) = aligned.checked_add_signed(delta_metric)
             && next <= Self::measure(&piece.summarize()) {
             Some(next)
@@ -51,21 +60,25 @@ impl<T: RopePiece> Metric<T> for BaseMetric {
     fn measure(sum: &T::S) -> usize {
         sum.len()
     }
-    fn from_base_units(_: &T::Context, _piece: &T, base_units: usize) -> usize {
+    fn from_base_units(_: &T::Context, _piece: &T, base_units: usize, _abs: usize) -> usize {
         base_units
     }
-    fn to_base_units(_: &T::Context, _piece: &T, measurement: usize) -> usize {
+    fn to_base_units(_: &T::Context, _piece: &T, measurement: usize, _abs: usize) -> usize {
         measurement
     }
 }
 
 /// Basic methods to allow automatic implementation of [CharMetric]
 pub trait WithCharMetric: RopePiece {
-    /// Returns a substring of the piece
-    fn substring<F, R>(
-        &self, context: &Self::Context, start: usize, end: usize,
+    /// Returns one or multiple substrings of the piece
+    ///
+    /// `abs_base` is the absolute start base offset of the current piece
+    /// if [RopePiece::ABS] is true.
+    fn substring<F, R: Default>(
+        &self, context: &Self::Context,
+        range: Range<usize>, abs_base: usize,
         f: F,
-    ) -> R where F: FnMut(&str) -> R;
+    ) -> R where F: FnMut(&str, R) -> R;
     /// Returns the number of characters in the piece
     fn chars(sum: &Self::S) -> usize;
 }
@@ -77,14 +90,28 @@ impl<T: WithCharMetric> Metric<T> for CharMetric {
         T::chars(sum)
     }
 
-    fn from_base_units(context: &T::Context, piece: &T, base_units: usize) -> usize {
-        piece.substring(context, 0, base_units, |s| s.chars().count())
+    fn from_base_units(context: &T::Context, piece: &T, base_units: usize, abs: usize) -> usize {
+        piece.substring(context, 0..base_units, abs, |s, sum| s.chars().count() + sum)
     }
 
-    fn to_base_units(context: &T::Context, piece: &T, measurement: usize) -> usize {
-        piece.substring(context, 0, piece.len(), |s| {
-            s.char_indices()
-                .nth(measurement).map(|(i, _)| i).unwrap_or(piece.len())
+    fn to_base_units(context: &T::Context, piece: &T, mut measurement: usize, abs: usize) -> usize {
+        piece.substring(context, 0..piece.len(), abs, |s, sum| {
+            if measurement == 0 {
+                sum
+            } else {
+                let mut last_n = 0;
+                let mut last_i = 0;
+                for (n, (i, _)) in s.char_indices().enumerate() {
+                    last_n = n;
+                    last_i = i;
+                    if n == measurement {
+                        measurement = 0;
+                        return sum + i;
+                    }
+                }
+                measurement -= last_n;
+                sum + last_i
+            }
         })
     }
 }
@@ -245,6 +272,14 @@ impl<'a, T: RopePiece> Cursor<'a, T> {
     }
 }
 
+pub(crate) fn abs_node_offset<T: RopePiece>(tree: &RbSlab<T>, x: Ref) -> usize {
+    if let Some(x) = x {
+        CursorPos::new(x, T::S::identity()).abs_offset(tree).len()
+    } else {
+        0
+    }
+}
+
 pub(crate) fn rel_node_at_metric<T: RopePiece, M: Metric<T>>(
     tree: &RbSlab<T>, context: &T::Context, mut x: Ref, mut offset: usize,
 ) -> Option<CursorPos<T>> {
@@ -262,8 +297,9 @@ pub(crate) fn rel_node_at_metric<T: RopePiece, M: Metric<T>>(
             if pre_len >= offset {
                 offset -= left_len;
                 debug_assert!((offset == 0) == (n_len == 0));
-                let base_offset = M::to_base_units(context, &n.piece, offset);
-                let offset = n.piece.measure_offset(context, base_offset);
+                let abs_start = if T::ABS { abs_node_offset(tree, Some(xi)) } else { 0 };
+                let base_offset = M::to_base_units(context, &n.piece, offset, abs_start);
+                let offset = n.piece.measure_offset(context, base_offset, abs_start);
                 return Some(CursorPos::new(xi, offset));
             } else {
                 offset -= pre_len;
@@ -279,15 +315,16 @@ pub(crate) fn rel_node_at<T: RopePiece, M: Metric<T>>(
 ) -> Option<CursorPos<T>> {
     let x = from.node;
     let n = &tree[x];
+    let abs_start = if T::ABS { abs_node_offset(tree, Some(x)) } else { 0 };
     if dir == LEFT && let Some(next) = M::navigate(
-        context, &n.piece, &from.offset_in_node, (metric_offset as isize).neg(),
+        context, &n.piece, &from.offset_in_node, (metric_offset as isize).neg(), abs_start,
     ) && next != 0 {
-        return Some(CursorPos::new(x, n.piece.measure_offset(context, next)));
+        return Some(CursorPos::new(x, n.piece.measure_offset(context, next, abs_start)));
     }
     if dir == RIGHT && let Some(next) = M::navigate(
-        context, &n.piece, &from.offset_in_node, metric_offset as isize,
+        context, &n.piece, &from.offset_in_node, metric_offset as isize, abs_start,
     ) {
-        return Some(CursorPos::new(x, n.piece.measure_offset(context, next)));
+        return Some(CursorPos::new(x, n.piece.measure_offset(context, next, abs_start)));
     }
 
     let mut offset_i = M::measure(&n.left_sum) as isize

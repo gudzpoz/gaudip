@@ -53,3 +53,12 @@ It should be possible to implement actual string ropes (and piece tables/trees
 too!) with this crate (via an externally supplied context object).
 
 [Rope]: https://en.wikipedia.org/wiki/Rope_(data_structure)
+
+## API
+
+After some experimentation, my conclusion is that it is very hard to provide a
+universal API for rope-like structures. Instead, we provide a generic basic API
+for string representation. If the user wants more fine-grained control over node
+properties (references into marker nodes, affinity, zero-width nodes, node
+mergeabilities, etc.), they should use the more low-level `Cursor/CursorPos`
+API.

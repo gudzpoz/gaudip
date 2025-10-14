@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::metrics::{CharMetric, WithCharMetric};
 use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
@@ -77,12 +79,12 @@ impl<Ext: Sum + FromStr> Summable for StringExt<Ext> {
 }
 
 impl<Ext: Sum + FromStr> WithCharMetric for StringExt<Ext> {
-    fn substring<F, R>(&self, _context: &Self::Context, start: usize, end: usize, mut f: F) -> R
+    fn substring<F, R: Default>(&self, _context: &Self::Context, range: Range<usize>, _abs: usize, mut f: F) -> R
     where
-        F: FnMut(&str) -> R
+        F: FnMut(&str, R) -> R
     {
-        let s = &self.s[start..end];
-        f(s)
+        let s = &self.s[range];
+        f(s, R::default())
     }
 
     fn chars(sum: &StringSum<Ext>) -> usize {
@@ -106,6 +108,7 @@ impl<Ext: Sum + FromStr> RopeContainer<StringExt<Ext>> for StringRope<Ext> {
 
 impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     type Context = ();
+    const ABS: bool = false;
 
     fn insert_or_split(&mut self, _context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
         let offset = offset.len();
@@ -163,7 +166,7 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     fn delete(&mut self, _context: &mut Self::Context) {
     }
 
-    fn measure_offset(&self, _context: &Self::Context, base_offset: usize) -> Self::S {
+    fn measure_offset(&self, _context: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
         StringSum {
             bytes: base_offset,
             chars: self.s[..base_offset].chars().count(),

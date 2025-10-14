@@ -9,9 +9,10 @@ authors = [
 edition.workspace = true
 
 [features]
-default = ["rope", "piece-tree"]
-rope = []
+default = ["gap-buffer", "piece-tree", "rope"]
+gap-buffer = []
 piece-tree = []
+rope = []
 
 [dependencies]
 slab = { workspace = true }
