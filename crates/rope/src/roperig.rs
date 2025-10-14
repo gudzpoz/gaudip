@@ -42,7 +42,7 @@
 // See crates/rope/LICENSE for more license information.
 
 use crate::metrics::{abs_node_offset, rel_node_at_metric, BaseMetric, Cursor, CursorPos, Metric};
-use crate::piece::{DeleteResult, Insertion, Measured, RopePiece, SplitResult, Sum};
+use crate::piece::{DeleteResult, Measured, RopePiece, SplitResult, Sum};
 use crate::rb_base::{Node, RbSlab, Ref, SafeRef, LEFT, RIGHT, SENTINEL};
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -123,25 +123,23 @@ impl<T: RopePiece> Rope<T> {
 
     /// Insert a node with `value` at `offset` in base metric
     pub fn insert(&mut self, offset: usize, value: T) {
-        let value = Insertion::from(value);
         if let Some(mut pos) = self.node_at_metric::<BaseMetric>(offset) {
             pos.insert(self, value);
         } else {
             assert_eq!(offset, 0);
-            self.sum = value.1;
-            self.rb_insert(None, value.0, LEFT);
+            self.sum = value.summarize();
+            self.rb_insert(None, value, LEFT);
         }
     }
 
     /// Similar to [Self::insert], but it tries to merge the insertion with adjacent nodes
     pub fn insert_merging(&mut self, offset: usize, value: T) {
-        let value = Insertion::from(value);
         if let Some(mut pos) = self.node_at_metric::<BaseMetric>(offset) {
             pos.insert_merging(self, value);
         } else {
             assert_eq!(offset, 0);
-            self.sum = value.1;
-            self.rb_insert(None, value.0, LEFT);
+            self.sum = value.summarize();
+            self.rb_insert(None, value, LEFT);
         }
     }
 
@@ -448,7 +446,7 @@ impl<T: RopePiece> CursorPos<T> {
         let (l, r) = rope.tree.get2_mut(left.node, right.node);
         if mergeable(&l.piece, &r.piece) {
             let r = right.delete(rope).1;
-            left.insert(rope, r.into());
+            left.insert(rope, r);
         }
         Some(left)
     }
@@ -497,10 +495,9 @@ impl<T: RopePiece> CursorPos<T> {
                 DeleteResult::TailSplit { mut deleted, split } => {
                     rope.sum.sub_assign(&deleted);
 
-                    let next: Insertion<T> = split.into();
-                    deleted.add_assign(&next.1);
+                    deleted.add_assign(&split.summarize());
                     rope.tree.update_metadata(start.node, &deleted.negate());
-                    rope.rb_insert(Some(start.node), next.0, RIGHT);
+                    rope.rb_insert(Some(start.node), split, RIGHT);
                 }
             }
             return Some(start);
@@ -574,23 +571,23 @@ impl<T: RopePiece> CursorPos<T> {
     }
 
     /// Inserts a piece at the cursor position
-    pub fn insert(&mut self, rope: &mut Rope<T>, value: Insertion<T>) {
-        rope.sum.add_assign(&value.1);
+    pub fn insert(&mut self, rope: &mut Rope<T>, value: T) {
+        rope.sum.add_assign(&value.summarize());
         let result = self.insert_1(rope, value);
         self.insert_2_insert(rope, result);
     }
 
     /// Inserts a piece at the cursor position and merges it with adjacent pieces if possible
-    pub fn insert_merging(&mut self, rope: &mut Rope<T>, value: Insertion<T>) {
-        rope.sum.add_assign(&value.1);
+    pub fn insert_merging(&mut self, rope: &mut Rope<T>, value: T) {
+        rope.sum.add_assign(&value.summarize());
         let result = self.insert_1(rope, value);
         self.insert_2_merging(rope, result);
     }
 
     /// First step of an insertion operation: try insertion
-    fn insert_1(&mut self, rope: &mut Rope<T>, value: Insertion<T>) -> SplitResult<T> {
+    fn insert_1(&mut self, rope: &mut Rope<T>, value: T) -> SplitResult<T> {
         let obj = &mut rope.tree[self.node];
-        let mut summary = value.1;
+        let mut summary = value.summarize();
         let result = obj.piece.insert_or_split(&mut rope.context, value, &self.offset_in_node);
         match &result {
             SplitResult::Merged => self.node_update(rope, &summary),
@@ -645,7 +642,7 @@ impl<T: RopePiece> CursorPos<T> {
                 let mut prev = self.clone();
                 if prev.prev_piece(rope) {
                     prev.offset_in_node = rope.tree[self.node].piece.summarize();
-                    let result = prev.insert_1(rope, head.into());
+                    let result = prev.insert_1(rope, head);
                     prev.insert_2_insert(rope, result);
                 } else {
                     rope.rb_insert(Some(self.node), head, LEFT);
@@ -660,7 +657,7 @@ impl<T: RopePiece> CursorPos<T> {
         };
 
         if self.next_piece(rope) {
-            let result = self.insert_1(rope, tail.into());
+            let result = self.insert_1(rope, tail);
             self.insert_2_insert(rope, result);
         } else {
             let len = tail.summarize();

@@ -1,5 +1,5 @@
 use crate::metrics::WithCharMetric;
-use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
+use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
 use crate::string::RopeContainer;
 use std::mem;
@@ -103,23 +103,23 @@ impl RopePiece for TreePiece {
     const ABS: bool = false;
 
     fn insert_or_split(
-        &mut self, context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S,
+        &mut self, context: &mut Self::Context, other: Self, offset: &Self::S,
     ) -> SplitResult<Self> {
         let offset = offset.len();
         if offset == 0 {
-            SplitResult::HeadSplit(other.0)
+            SplitResult::HeadSplit(other)
         } else if offset == self.len() {
-            if other.0.buffer == self.buffer
+            if other.buffer == self.buffer
                 && self.len() < MAX_PIECE_LEN
-                && other.0.buffer_offset == self.buffer_offset + self.len() {
-                self.sum.add_assign(&other.0.sum);
+                && other.buffer_offset == self.buffer_offset + self.len() {
+                self.sum.add_assign(&other.sum);
                 SplitResult::Merged
             } else {
-                SplitResult::TailSplit(other.0)
+                SplitResult::TailSplit(other)
             }
         } else {
             let split = self.split(context, offset);
-            SplitResult::MiddleSplit(other.0, split)
+            SplitResult::MiddleSplit(other, split)
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::metrics::BaseMetric;
-use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
+use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
 
 impl Sum for usize {
@@ -70,9 +70,8 @@ impl Summable for Alphabet {
 impl RopePiece for Alphabet {
     type Context = ();
     const ABS: bool = false;
-    fn insert_or_split(&mut self, _: &mut (), other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
+    fn insert_or_split(&mut self, _: &mut (), other: Self, offset: &Self::S) -> SplitResult<Self> {
         let offset = offset.len();
-        let other = other.0;
         if self.is_empty() {
             *self = other;
             SplitResult::Merged

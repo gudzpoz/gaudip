@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 use crate::metrics::WithCharMetric;
-use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
+use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
 use crate::string::RopeContainer;
 
@@ -60,20 +60,20 @@ impl RopePiece for Segment {
 
     fn insert_or_split(
         &mut self, _context: &mut Self::Context,
-        other: Insertion<Self>, offset: &Self::S,
+        other: Self, offset: &Self::S,
     ) -> SplitResult<Self> {
         if self.length < MAX_PIECE_LEN {
-            self.add_assign(&other.1);
+            self.add_assign(&other.summarize());
             SplitResult::Merged
         } else if offset.length == 0 {
-            SplitResult::HeadSplit(other.0)
+            SplitResult::HeadSplit(other)
         } else if offset.length == self.length {
-            SplitResult::TailSplit(other.0)
+            SplitResult::TailSplit(other)
         } else {
             let mut tail = *self;
             tail.sub_assign(offset);
             *self = *offset;
-            SplitResult::MiddleSplit(other.0, tail)
+            SplitResult::MiddleSplit(other, tail)
         }
     }
 

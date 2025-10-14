@@ -144,7 +144,7 @@ pub trait RopePiece: Summable + Sized {
     /// When the piece gets merged, the method should return [SplitResult::Merged].
     fn insert_or_split(
         &mut self, context: &mut Self::Context,
-        other: Insertion<Self>, offset: &Self::S,
+        other: Self, offset: &Self::S,
     ) -> SplitResult<Self>;
     /// Delete a portion from the current piece and return [Sum] of the deleted part
     fn delete_range(
@@ -163,14 +163,6 @@ pub trait RopePiece: Summable + Sized {
         &self, context: &Self::Context,
         base_offset: usize, abs_base_offset: usize,
     ) -> Self::S;
-}
-/// A piece, typically to be inserted, with its [Sum] precomputed
-pub struct Insertion<T: RopePiece>(pub T, pub T::S);
-impl<T: RopePiece> From<T> for Insertion<T> {
-    fn from(value: T) -> Self {
-        let sum = value.summarize();
-        Insertion(value, sum)
-    }
 }
 
 /// A reference to internal nodes, inherently unsafe

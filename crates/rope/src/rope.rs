@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::metrics::{CharMetric, WithCharMetric};
-use crate::piece::{DeleteResult, Insertion, RopePiece, SplitResult, Sum, Summable};
+use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
 use crate::string::RopeContainer;
 
@@ -110,21 +110,21 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     type Context = ();
     const ABS: bool = false;
 
-    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Insertion<Self>, offset: &Self::S) -> SplitResult<Self> {
+    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Self, offset: &Self::S) -> SplitResult<Self> {
         let offset = offset.len();
-        let len = self.s.len() + other.0.s.len();
+        let len = self.s.len() + other.s.len();
         if offset == 0 {
             if len > MAX_PIECE_SIZE {
-                return SplitResult::HeadSplit(other.0);
+                return SplitResult::HeadSplit(other);
             }
         } else if offset == self.s.len() {
             if len > MAX_PIECE_SIZE {
-                return SplitResult::TailSplit(other.0);
+                return SplitResult::TailSplit(other);
             }
         } else if len > MAX_PIECE_SIZE {
             let tail_sum = Ext::from_str(&self.s[offset..]);
             let tail_chars = self.s[offset..].chars().count();
-            let mut split = other.0;
+            let mut split = other;
             return if offset > MIN_PIECE_SIZE {
                 split.s.push_str(&self.s[offset..]);
                 split.chars += tail_chars;
@@ -144,9 +144,9 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
                 })
             };
         }
-        self.s.insert_str(offset, &other.0.s);
-        self.chars += other.0.chars;
-        self.extra.add_assign(&other.0.extra);
+        self.s.insert_str(offset, &other.s);
+        self.chars += other.chars;
+        self.extra.add_assign(&other.extra);
         SplitResult::Merged
     }
 
