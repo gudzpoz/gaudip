@@ -1,48 +1,13 @@
-use gtk::glib;
-use gtk::glib::Object;
+pub mod data;
+pub mod window;
+pub mod utils;
+
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
+use gtk::Orientation::Vertical;
+use crate::window::BufferWindow;
 
 const APP_ID: &str = "party.iroiro.juicemacs.gaudip";
-
-glib::wrapper! {
-    pub struct TestWidget(ObjectSubclass<imp::TestWidget>)
-    @extends gtk::Widget,
-    @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
-}
-mod imp {
-    use gtk::prelude::{SnapshotExt, WidgetExt};
-    use gtk::subclass::prelude::{ObjectImpl, ObjectSubclass, ObjectSubclassExt, WidgetImpl};
-    use gtk::{gdk, glib, graphene, Snapshot};
-
-    #[derive(Default)]
-    pub struct TestWidget();
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for TestWidget {
-        const NAME: &'static str = "TestWidget";
-        type Type = super::TestWidget;
-        type ParentType = gtk::Widget;
-    }
-
-    impl ObjectImpl for TestWidget {}
-    impl WidgetImpl for TestWidget {
-        fn snapshot(&self, snapshot: &Snapshot) {
-            let red = gdk::RGBA::RED;
-            let green = gdk::RGBA::GREEN;
-            let yellow = gdk::RGBA::parse("yellow").unwrap();
-            let blue = gdk::RGBA::BLUE;
-            let obj = self.obj();
-            let w: f32 = obj.width() as f32 / 2.0;
-            let h: f32 = obj.height() as f32 / 2.0;
-            for (i, color) in [red, green, yellow, blue].iter().enumerate() {
-                let x = w * (i % 2) as f32;
-                let y = h * (i / 2) as f32;
-                snapshot.append_color(color, &graphene::Rect::new(x, y, w, h));
-            }
-        }
-    }
-}
 
 fn main() -> glib::ExitCode {
     env_logger::init();
@@ -54,12 +19,14 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
-    let child: TestWidget = Object::builder().build();
+    let layout = gtk::Box::new(Vertical, 0);
+    let child = BufferWindow::new();
+    layout.append(&child);
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("九叠")
-        .child(&child)
+        .child(&layout)
         .build();
 
     window.present();

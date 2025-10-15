@@ -382,6 +382,7 @@ impl<T: RopePiece> CursorPos<T> {
     ///
     /// Returns a new cursor pointing to the start of the inserted node
     pub fn insert_left(&self, rope: &mut Rope<T>, piece: T) -> Self {
+        rope.sum.add_assign(&piece.summarize());
         let new = rope.rb_insert(Some(self.node), piece, LEFT);
         Self::new(new, T::S::identity())
     }
@@ -389,6 +390,7 @@ impl<T: RopePiece> CursorPos<T> {
     ///
     /// Returns a new cursor pointing to the start of the inserted node
     pub fn insert_right(&self, rope: &mut Rope<T>, piece: T) -> Self {
+        rope.sum.add_assign(&piece.summarize());
         let new = rope.rb_insert(Some(self.node), piece, RIGHT);
         Self::new(new, T::S::identity())
     }
