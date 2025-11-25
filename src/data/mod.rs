@@ -1,3 +1,3 @@
 pub mod buffer;
 pub mod segment;
-pub mod lines;
+pub mod virtlines;

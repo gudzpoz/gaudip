@@ -41,9 +41,6 @@ impl From<PangoUnit> for PixelUnit {
 }
 impl From<PangoUnit> for f64 {
     fn from(val: PangoUnit) -> Self {
-        if val.0 < 0 {
-            return -1f64;
-        }
         val.0 as f64 / PANGO_SCALE as f64
     }
 }
