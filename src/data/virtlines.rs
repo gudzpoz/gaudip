@@ -4,7 +4,7 @@ use roperig::metrics::Metric;
 use roperig::piece::{Sum, Summable};
 
 /// Info about a virtual line
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineInfo {
     /// Number of chars in this line, line feed char(s) included
     pub chars: usize,
@@ -34,16 +34,15 @@ impl Sum for LineInfo {
     }
 
     fn identity() -> Self {
-        Self { chars: 0, lines: 0, height: 0 }
+        Default::default()
     }
 }
 
-pub type Id = Option<NonZero<usize>>;
-struct OpaqueLine {
-    id: Id,
+pub struct OpaqueLine<T> {
+    line: Option<T>,
     info: LineInfo,
 }
-impl Summable for OpaqueLine {
+impl<T> Summable for OpaqueLine<T> {
     type S = LineInfo;
     fn summarize(&self) -> Self::S {
         self.info
@@ -51,13 +50,13 @@ impl Summable for OpaqueLine {
 }
 
 struct LineMetric();
-impl Metric<OpaqueLine> for LineMetric {
+impl<T> Metric<OpaqueLine<T>> for LineMetric {
     fn measure(sum: &LineInfo) -> usize {
         sum.lines
     }
 }
 struct HeightMetric();
-impl Metric<OpaqueLine> for HeightMetric {
+impl<T> Metric<OpaqueLine<T>> for HeightMetric {
     fn measure(sum: &LineInfo) -> usize {
         sum.height
     }
@@ -65,34 +64,46 @@ impl Metric<OpaqueLine> for HeightMetric {
 
 pub type LineNumber = NonZero<usize>;
 /// Representation of a collection of lines and a viewport into them
-#[derive(Default)]
-pub struct VirtualLines {
-    rope: RopeBase<OpaqueLine>,
-    current: Option<PartialCursorPos<OpaqueLine, HeightMetric>>,
+pub struct VirtualLines<T> {
+    rope: RopeBase<OpaqueLine<T>>,
+    current: Option<PartialCursorPos<OpaqueLine<T>, HeightMetric>>,
 }
-pub struct LineIter<'a> {
-    rope: &'a RopeBase<OpaqueLine>,
-    current: Option<PartialCursorPos<OpaqueLine, HeightMetric>>,
-    offset: usize,
-}
-impl<'a> Iterator for LineIter<'a> {
-    type Item = (isize, Id, &'a LineInfo);
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut offset: isize = self.offset.try_into().unwrap_or(isize::MAX);
-        loop {
-            let current = self.current.as_ref()?;
-            let start = offset.saturating_sub_unsigned(current.offset().value);
-            let line = current.get(self.rope);
-            offset = start.saturating_add_unsigned(line.info.height);
-            self.current = current.next_piece(self.rope);
-            if offset >= 0 {
-                self.offset = offset as usize;
-                return Some((start, line.id, &line.info));
-            }
-        }
+impl<T> Default for VirtualLines<T> {
+    fn default() -> Self {
+        Self { rope: Default::default(), current: None }
     }
 }
-impl VirtualLines {
+pub struct LineIter<T> {
+    current: Option<PartialCursorPos<OpaqueLine<T>, HeightMetric>>,
+}
+impl<T> LineIter<T> {
+    pub fn has_next(&self) -> bool {
+        self.current.is_some()
+    }
+    pub fn current<'a>(
+        &self, lines: &'a VirtualLines<T>,
+    ) -> Option<(isize, Option<&'a T>, &'a LineInfo)> {
+        let current = self.current.as_ref()?;
+        let start = 0isize.saturating_sub_unsigned(current.offset().value);
+        let line = current.get(&lines.rope);
+        Some((start, line.line.as_ref(), &line.info))
+    }
+    pub fn current_mut<'a>(&self, lines: &'a mut VirtualLines<T>) -> Option<&'a mut T> {
+        let current = self.current.as_ref()?;
+        let line = current.get_mut(&mut lines.rope);
+        line.line.as_mut()
+    }
+    pub fn update_line(&self, lines: &mut VirtualLines<T>, delta: &LineInfo) {
+        let Some(current) = self.current.as_ref() else { return };
+        current.get_mut(&mut lines.rope).info.add_assign(delta);
+        current.update(&mut lines.rope, delta);
+    }
+    pub fn advance(&mut self, lines: &VirtualLines<T>) {
+        let Some(current) = self.current.as_ref() else { return };
+        self.current = current.next_piece(&lines.rope);
+    }
+}
+impl<T> VirtualLines<T> {
     /// Returns the total height
     pub fn height(&self) -> usize {
         self.rope.len::<HeightMetric>()
@@ -103,12 +114,8 @@ impl VirtualLines {
         LineNumber::new(current.position(&self.rope) + 1)
     }
     /// Returns an iterator starting from the current line
-    pub fn iter_from_current(&'_ self) -> LineIter<'_> {
-        LineIter {
-            rope: &self.rope,
-            current: self.current.clone(),
-            offset: 0,
-        }
+    pub fn iter_from_current(&self) -> LineIter<T> {
+        LineIter { current: self.current.clone() }
     }
     /// Sets the current line by scrolling a percentage
     pub fn scroll(&mut self, percent: f64) {
@@ -137,9 +144,15 @@ impl VirtualLines {
         let Some(next) = current.navigate(&self.rope, delta) else { return };
         self.current = Some(next);
     }
+    /// Gets a line by on-screen y coordinate
+    pub fn line_at_rel_height(&self, height: usize) -> Option<(usize, LineIter<T>)> {
+        let current = self.current.as_ref()?;
+        let cursor = current.navigate(&self.rope, height as isize)?;
+        Some((cursor.offset().value, LineIter { current: Some(cursor) }))
+    }
     /// Inserts a new line
-    pub fn insert_line(&mut self, at: LineNumber, line: LineInfo, link: Id) {
-        let line = OpaqueLine { id: link, info: line };
+    pub fn insert_line(&mut self, at: LineNumber, info: LineInfo, extra: Option<T>) {
+        let line = OpaqueLine { line: extra, info };
         let Some(cursor) = self.rope.cursor_at::<LineMetric>(at.get() - 1) else {
             self.rope.init(Some(line).into_iter());
             self.current = self.rope.cursor_at::<HeightMetric>(0);

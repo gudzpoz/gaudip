@@ -1,10 +1,10 @@
+use crate::data::segment::PangoMetric;
+
 use super::segment::EStrSegment;
-use gtk::pango::AttrList;
-use roperig::metrics::{BaseMetric, CharMetric};
-use roperig::roperig::Rope;
-use roperig::string::RopeContainer;
-use std::cell::RefCell;
-use crate::utils::pango_utils::{PangoUnit, PixelUnit};
+use std::ops::Range;
+use roperig::piece::{Sum, Summable};
+use roperig::metrics::BaseMetric;
+use roperig::ropebase::{ConvertedPosition, PartialCursorPos, RopeBase};
 
 /// A buffer for a line
 ///
@@ -12,158 +12,116 @@ use crate::utils::pango_utils::{PangoUnit, PixelUnit};
 #[derive(Default)]
 pub struct LineBuffer {
     pango_str: Vec<u8>,
-    pango_attrs: AttrList,
-    pango_layout: RefCell<Option<gtk::pango::Layout>>,
-    metrics: Rope<EStrSegment>,
-}
-
-impl RopeContainer<EStrSegment> for LineBuffer {
-    fn rope(&self) -> &Rope<EStrSegment> {
-        &self.metrics
-    }
-    fn rope_mut(&mut self) -> &mut Rope<EStrSegment> {
-        &mut self.metrics
-    }
+    metrics: RopeBase<EStrSegment>,
 }
 
 impl LineBuffer {
     pub fn pango_bytes(&self) -> &[u8] {
         &self.pango_str
     }
-    pub fn attrs(&self) -> &AttrList {
-        &self.pango_attrs
-    }
-    pub fn pango_layout<F>(&self, context: &gtk::pango::Context, width: i32, mut f: F)
-    where F: FnMut(&gtk::pango::Layout) {
-        let width = PixelUnit(width);
-        let mut inner = self.pango_layout.borrow_mut();
-        let layout = match &*inner {
-            Some(layout) => {
-                if PangoUnit(layout.width()) != width.into() {
-                    layout.set_width(PangoUnit::from(width).0);
-                }
-                layout
-            }
-            _ => {
-                let layout = gtk::pango::Layout::new(context);
-                layout.set_width(PangoUnit::from(width).0);
-                layout.set_text(&unsafe {
-                    str::from_utf8_unchecked(&self.pango_str)
-                });
-                inner.replace(layout);
-                &inner.as_ref().unwrap()
-            }
-        };
-        f(layout);
+    pub fn chars(&self) -> usize {
+        self.metrics.base_len()
     }
 
-    pub fn split(&mut self, index: usize) -> LineBuffer {
-        let mut pieces = Vec::new();
-        let start = self.index_to_byte(index);
-        let end = self.metrics.len();
-        self.metrics.for_range::<BaseMetric>(start..end, |_, piece, range, _| {
-            let mut newp = piece.clone();
-            if range.end.bytes != piece.chars_bytes().1 {
-                newp.split(range.end.bytes);
-            }
-            if range.start.bytes != 0 {
-                newp = newp.split(range.start.bytes);
-            }
-            pieces.push(newp);
-            true
-        });
-        let mut new: Rope<EStrSegment> = Rope::default();
-        new.insert_many_after(None, pieces.len(), pieces.into_iter());
-        let new_line = LineBuffer {
-            pango_str: self.pango_str[start..].to_vec(),
-            pango_attrs: self.pango_attrs.copy().inspect(|list| {
-                list.update(0, start as i32, 0);
-            }).unwrap_or_else(|| {
-                let new_list = AttrList::new();
-                new_list.update(0, 0, (end - start) as i32);
-                new_list
-            }),
-            pango_layout: Default::default(),
+    pub fn byte_index_to_char(&self, bytes: usize) -> usize {
+        let ConvertedPosition {
+            piece, piece_position, offset_in_piece,
+        } = self.metrics.convert_metrics::<PangoMetric, BaseMetric>(bytes);
+        let Some(piece) = piece else { return piece_position.value };
+        piece.pango_offset_to_char_offset(offset_in_piece.value) + piece_position.value
+    }
+
+    pub fn split(&mut self, char_index: usize) -> LineBuffer {
+        let (byte_offset, cursor) = self.char_index_to_byte(char_index);
+        let tail_str = self.pango_str.split_off(byte_offset);
+
+        let Some(cursor) = cursor else { return LineBuffer::default() };
+        let at = cursor.get_mut(&mut self.metrics);
+        let right = at.split(cursor.offset().value);
+        cursor.update(&mut self.metrics, &right.summarize().negate());
+
+        let mut pieces = vec![right];
+        if let Some(rest) = cursor.next_piece(&self.metrics) {
+            let end = self.metrics.cursor_at::<BaseMetric>(self.metrics.base_len()).expect("not empty");
+            rest.delete_many_to(&mut self.metrics, end, |piece| pieces.push(piece));
+        }
+
+        let mut new = RopeBase::default();
+        new.init(pieces.into_iter());
+        LineBuffer {
+            pango_str: tail_str,
             metrics: new,
-        };
-        self.metrics.delete(start..end - start);
-        self.pango_str.resize(start, 0);
-        self.pango_attrs.update(start as i32, (end - start) as i32, 0);
-        new_line
+        }
     }
 
-    pub fn clear(&mut self) {
-        self.pango_str.clear();
-        self.pango_attrs = AttrList::new();
-        self.metrics = Rope::default();
-    }
-
-    pub fn delete(&mut self, from: usize, len: usize) {
-        if len == 0 {
+    pub fn delete(&mut self, chars: Range<usize>) {
+        if chars.is_empty() {
             return;
         }
-        let start = self.index_to_byte(from);
-        let end = self.index_to_byte(from + len);
-        self.metrics.delete(start..end);
-        self.pango_str.drain(start..end);
-        self.pango_attrs.update(
-            i32::try_from(start).unwrap(),
-            i32::try_from(end - start).unwrap(),
-            0,
-        );
+        let (start_bytes, from) = self.char_index_to_byte(chars.start);
+        let (end_bytes, to) = self.char_index_to_byte(chars.end);
+        let (Some(mut from), Some(to)) = (from, to) else { return };
+        self.pango_str.drain(start_bytes..end_bytes);
+        if from.is_same_piece(&to) {
+            let piece = from.get_mut(&mut self.metrics);
+            let mut sum = piece.summarize().negate();
+            let tail = piece.split(to.offset().value);
+            if from.offset().value != 0 {
+                piece.split(from.offset().value);
+            }
+            sum.add_assign(&piece.summarize());
+            from.update(&mut self.metrics, &sum);
+            if !tail.is_empty() {
+                from.insert_right(&mut self.metrics, tail);
+            }
+            if from.offset().value == 0 {
+                from.delete(&mut self.metrics);
+            }
+            return;
+        }
+        if from.offset().value != 0 {
+            let piece = from.get_mut(&mut self.metrics);
+            let delta = piece.split(from.offset().value).summarize().negate();
+            from.update(&mut self.metrics, &delta);
+            from = from.next_piece(&self.metrics).expect("from < to");
+        }
+        if to.offset().value != to.get(&self.metrics).len() {
+            let piece = to.get_mut(&mut self.metrics);
+            let keep = piece.split(to.offset().value);
+            let delta = keep.summarize().negate();
+            to.update(&mut self.metrics, &delta);
+            to.insert_right(&mut self.metrics, keep);
+        }
+        from.delete_many_to(&mut self.metrics, to, |_| {});
     }
 
-    pub fn insert_ascii(&mut self, index: usize, bytes: &[u8]) {
-        self.insert(index, EStrSegment::from_ascii(bytes));
-    }
-    pub fn insert_raw(&mut self, index: usize, bytes: &[u8]) {
-        self.insert(index, EStrSegment::from_raw(bytes));
-    }
-    pub fn insert_utf32(&mut self, index: usize, bytes: &[u8], stride: usize) {
-        self.insert(index, match stride {
-            0 => EStrSegment::from_utf32_stride1(bytes),
-            1 => EStrSegment::from_utf32_stride2(bytes),
-            4 => EStrSegment::from_utf32_stride4(bytes),
-            _ => panic!("invalid stride"),
-        });
-    }
-    pub fn insert_emacs(&mut self, index: usize, bytes: &[u8]) {
-        let mut vec = Vec::new();
-        let mut extra = 0;
-        for segment in EStrSegment::from_emacs(bytes) {
-            extra += segment.len();
-            vec.push(segment);
-        }
-        let mut offset = self.index_to_byte(index);
-        self.expand_str(offset, extra);
-        for segment in EStrSegment::from_emacs(bytes) {
-            let len = segment.len();
-            segment.write(&mut self.pango_str[offset..(offset + len)]);
-            offset += len;
-        }
-        while let Some(element) = vec.pop() {
-            self.metrics.insert(offset, element);
-        }
-        self.pango_attrs.update(
-            i32::try_from(offset).unwrap(),
-            0,
-            i32::try_from(extra).unwrap(),
-        );
-    }
-    pub(crate) fn insert_segment(&mut self, index: usize, s: EStrSegment) {
-        self.insert(index, s);
-    }
-    fn insert(&mut self, index: usize, s: EStrSegment) {
-        let offset = self.index_to_byte(index);
+    pub fn insert(&mut self, char_index: usize, s: EStrSegment) {
+        let (offset, cursor) = self.char_index_to_byte(char_index);
+        let Some(cursor) = cursor else {
+            if self.metrics.is_empty() && char_index == 0 {
+                let extra = s.len();
+                self.expand_str(offset, extra);
+                s.write(&mut self.pango_str[offset..offset + extra]);
+                self.metrics.init(Some(s).into_iter());
+            }
+            return;
+        };
         let extra = s.len();
         self.expand_str(offset, extra);
         s.write(&mut self.pango_str[offset..offset + extra]);
-        self.metrics.insert(offset, s);
-        self.pango_attrs.update(
-            i32::try_from(offset).unwrap(),
-            0,
-            i32::try_from(extra).unwrap(),
-        );
+
+        if cursor.offset().value == 0 {
+            cursor.insert_left(&mut self.metrics, s);
+        } else if cursor.offset().value == cursor.get(&self.metrics).len() {
+            cursor.insert_right(&mut self.metrics, s);
+        } else {
+            let piece = cursor.get_mut(&mut self.metrics);
+            let tail = piece.split(cursor.offset().value);
+            let delta = tail.summarize().negate();
+            cursor.update(&mut self.metrics, &delta);
+            cursor.insert_right(&mut self.metrics, tail);
+            cursor.insert_right(&mut self.metrics, s);
+        }
     }
 
     fn expand_str(&mut self, offset: usize, extra: usize) {
@@ -172,24 +130,26 @@ impl LineBuffer {
         self.pango_str.copy_within(offset..end, offset + extra);
     }
 
-    fn index_to_byte(&self, index: usize) -> usize {
-        self.metrics.convert_metrics::<CharMetric, BaseMetric>(index).unwrap_or(0)
+    fn char_index_to_byte(&self, index: usize) -> (usize, Option<PartialCursorPos<EStrSegment, BaseMetric>>) {
+        let (acc, cursor) = self.metrics.accumulate::<BaseMetric, _, _>(
+            index, |acc, s| acc + s.pango, 0,
+        );
+        let Some(cursor) = cursor else { return (acc, None) };
+        let byte_offset = acc + cursor.get(&self.metrics).char_offset_to_pango_offset(cursor.offset().value);
+        (byte_offset, Some(cursor))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::segment::metrics::tests::utf32_stride4_to_bytes;
 
     #[test]
     fn test_emacs_string() {
-        let mut buffer = LineBuffer::default();
         let s = "Hello! 你好！ こんにちは！˚˖𓍢🌷✧˚.🎀⋆ \u{10FFFF}";
-        let vec: Vec<u32> = s.chars().map(|c| c as u32).collect();
         for _ in 0..2 {
-            buffer.clear();
-            buffer.insert_emacs(0, utf32_stride4_to_bytes(&vec));
+            let mut buffer = LineBuffer::default();
+            buffer.insert(0, s.into());
             assert_eq!(s.as_bytes(), buffer.pango_str);
         }
     }
@@ -198,7 +158,7 @@ mod tests {
     fn test_split() {
         let mut buffer = LineBuffer::default();
         let s = "Hello!World!";
-        buffer.insert_ascii(0, s.as_bytes());
+        buffer.insert(0, s.into());
         assert_eq!(s.as_bytes(), buffer.pango_bytes());
         let new_line = buffer.split(6);
         assert_eq!("Hello!".as_bytes(), buffer.pango_bytes());

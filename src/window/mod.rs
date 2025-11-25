@@ -35,6 +35,12 @@ impl BufferWindow {
         obj
     }
 }
+impl Default for BufferWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 mod imp {
     use std::cell::Cell;
     use std::option::Option;

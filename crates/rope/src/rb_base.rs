@@ -826,8 +826,8 @@ impl<T: Summable> RbSlab<T> {
         let Some(root) = root else { return };
         let children = self[root].rb.children;
         let node = self.slab.remove(root.get());
-        dropper(node.piece);
         self.drop_tree(children[LEFT], dropper);
+        dropper(node.piece);
         self.drop_tree(children[RIGHT], dropper);
     }
 }

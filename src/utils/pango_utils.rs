@@ -12,6 +12,9 @@ pub struct PixelUnit(pub i32);
 pub struct PangoUnit(pub i32);
 
 impl PangoUnit {
+    pub fn from_pixels(pixels: f64) -> Self {
+        PangoUnit((pixels * PANGO_SCALE as f64) as i32)
+    }
     pub fn pixels(self) -> i32 {
         PixelUnit::from(self).0
     }

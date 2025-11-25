@@ -1,151 +1,162 @@
 use std::io::{Cursor, Write};
-use std::mem::replace;
-use roperig::metrics::WithCharMetric;
+use std::ops::Range;
+use roperig::metrics::Metric;
 use roperig::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use EStrSegment::*;
-use crate::data::segment::metrics::EStrMetrics;
 
 /// A segment of Emacs string
 ///
-/// See [EStrMetrics] for meaning of `len` and `bytes`.
-#[derive(Default, Clone, Debug)]
+/// In contrast to normal strings, for which [BaseMetric] usually means bytes,
+/// for [EStrSegment] (which is intended for rendering), [BaseMetric] means Emacs characters.
+///
+/// We don't support [CharMetric], but instead offer [PangoMetric] to measure the produced
+/// Pango string length in bytes.
+#[derive(Clone, Debug)]
 pub enum EStrSegment {
-    #[default]
-    Empty,
-    /// `len` and `bytes`: as is defined by UTF-8
-    Unicode { str: String, len: usize },
-    /// `len` and `bytes`: the same unit
+    /// `chars`: Unicode chars; `pango`: UTF-8 bytes
+    Unicode { str: String, chars: usize },
+    /// `chars` and `pango`: the same
     Ascii { str: String },
-    /// `len`: char counts, `bytes`: one byte for ASCII, 4 bytes for `0x80` and above (`\XXX`)
-    RawBytes { str: Vec<u8>, bytes: usize },
-    /// `len`: char counts, `bytes`: a single byte (rendered with custom renderer)
-    NonUnicode { str: Vec<u32> },
+    /// `chars`: char counts, i.e., raw byte count;
+    /// `pango`: one byte for ASCII, 4 bytes for `0x80` and above (`\XXX`)
+    RawBytes { str: Vec<u8>, pango: usize },
+    /// `chars`: char counts (in `utf-8-emacs` coding), 1 or 4 character only for now;
+    /// `pango`: a single byte (rendered with custom renderer)
+    NonUnicode { c: u32 },
+    /// `chars` and `pango`: 1
     Widget { width: usize, height: usize },
 }
 impl From<&str> for EStrSegment {
     fn from(value: &str) -> Self {
-        Self::from_ascii_or(value.to_string(), value.len())
+        Self::from_counted_utf8(value.to_string(), value.len())
     }
 }
 
-const MIN_CHILD_LEN: usize = 32;
-const MAX_CHILD_LEN: usize = 64;
+/// An enum to hopefully reduce allocations for ASCII/UTF-8 strings
+pub enum OptimisticParseResult {
+    Single(EStrSegment),
+    Mixed(Vec<EStrSegment>),
+}
+impl ExactSizeIterator for OptimisticParseResult {}
+impl Iterator for OptimisticParseResult {
+    type Item = EStrSegment;
 
-macro_rules! from_utf32_impl {
-    ($name:ident, $stride_shift:expr, $ptr_type:ty) => {
-        pub fn $name(str: &[u8]) -> EStrSegment {
-            let stride = 1 << $stride_shift;
-            debug_assert!(str.len() % stride == 0);
-            let mut s = String::with_capacity(str.len() >> $stride_shift);
-            let base = str.as_ptr();
-            for i in (0..str.len()).step_by(stride) {
-                let c = unsafe { (base.add(i) as *const $ptr_type).read_unaligned() };
-                s.push(unsafe { char::from_u32_unchecked(c as u32) });
-            }
-            Self::from_ascii_or(s, str.len() >> $stride_shift)
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            OptimisticParseResult::Single(_) => {
+                let s = std::mem::replace(self, OptimisticParseResult::Mixed(vec![]));
+                Some(match s {
+                    OptimisticParseResult::Single(s) => s,
+                    OptimisticParseResult::Mixed(_) => unreachable!(),
+                })
+            },
+            OptimisticParseResult::Mixed(estr_segments) => {
+                estr_segments.pop()
+            },
         }
-    };
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            OptimisticParseResult::Single(_) => (1, Some(1)),
+            OptimisticParseResult::Mixed(v) => (v.len(), Some(v.len())),
+        }
+    }
 }
 
 impl EStrSegment {
+    /// Creates a segment from ASCII bytes
     pub fn from_ascii(str: &[u8]) -> EStrSegment {
+        debug_assert!(str.is_ascii());
         Ascii {
             str: unsafe { String::from_utf8_unchecked(str.to_owned()) }
         }
     }
+    /// Creates a segment from raw bytes
     pub fn from_raw(bytes: &[u8]) -> EStrSegment {
-        let len = raw_bytes_pango_bytes(bytes);
+        let len = raw_bytes_to_pango_byte_count(bytes);
         if len == bytes.len() {
             Ascii { str: unsafe { String::from_utf8_unchecked(bytes.to_vec()) } }
         } else {
-            RawBytes{ str: bytes.to_vec(), bytes: len }
+            RawBytes{ str: bytes.to_vec(), pango: len }
         }
     }
-
-    from_utf32_impl!(from_utf32_stride1, 0, u8);
-    from_utf32_impl!(from_utf32_stride2, 1, u16);
-    from_utf32_impl!(from_utf32_stride4, 2, u32);
-
-    fn from_ascii_or(str: String, len: usize) -> EStrSegment {
-        if str.len() == len {
+    /// Creates a segment from UTF-8 bytes, with precalculated char count
+    fn from_counted_utf8(str: String, chars: usize) -> EStrSegment {
+        if str.len() == chars {
             Ascii { str }
         } else {
-            Unicode { str, len }
+            Unicode { str, chars }
         }
     }
-    pub fn from_emacs(str: &[u8]) -> Vec<EStrSegment> {
-        struct Builder {
-            vec: Vec<EStrSegment>,
-            state: EStrSegment,
+    /// Creates a segment from UTF-8 bytes
+    pub fn from_utf8(str: &str) -> EStrSegment {
+        EStrSegment::from_counted_utf8(str.to_string(), str.chars().count())
+    }
+    /// Creates a segment from `utf-8-emacs` bytes
+    ///
+    /// See `character.h` in Emacs code for details.
+    pub fn from_emacs(str: &[u8]) -> OptimisticParseResult {
+        let partial = match str::from_utf8(str) {
+            Ok(str) => return OptimisticParseResult::Single(
+                EStrSegment::from_counted_utf8(str.to_string(), str.chars().count()),
+            ),
+            Err(err) => err.valid_up_to(),
+        };
+
+        fn from_partial_utf8(str: &[u8], partial: Range<usize>) -> EStrSegment {
+            let s = unsafe { str::from_utf8_unchecked(&str[partial]) };
+            EStrSegment::from_counted_utf8(s.to_string(), s.chars().count())
         }
-        impl Builder {
-            fn push(&mut self, c: u32) {
-                match (&mut self.state, char::from_u32(c)) {
-                    (Ascii { str }, Some(uni_c))
-                    if uni_c.is_ascii() => {
-                        str.push(uni_c)
+
+        let mut vec: Vec<EStrSegment> = vec![from_partial_utf8(str, 0..partial)];
+        let mut from = partial;
+        while from < str.len() {
+            let (c, advance) = next_emacs_codepoint(str, from).unwrap_or((0x3FFF00 + str[from] as u32, 1));
+            vec.push(EStrSegment::NonUnicode { c });
+            from += advance;
+            from += match str::from_utf8(&str[from..]) {
+                Ok(str) => {
+                    if !str.is_empty() {
+                        vec.push(EStrSegment::from_counted_utf8(str.to_string(), str.chars().count()));
                     }
-                    (Unicode { str, ref mut len }, Some(uni_c))
-                    if str.len() < MAX_CHILD_LEN => {
-                        str.push(uni_c);
-                        *len += 1;
+                    str.len()
+                },
+                Err(err) => {
+                    let partial = err.valid_up_to();
+                    if partial > 0 {
+                        vec.push(from_partial_utf8(str, from..from + partial));
                     }
-                    (NonUnicode { str }, None) if c < 0x3FFF80 => {
-                        str.push(c);
-                    }
-                    (RawBytes { str, ref mut bytes }, Some(uni_c))
-                    if uni_c.is_ascii() && str.len() < MAX_CHILD_LEN => {
-                        str.push(uni_c as u8);
-                        *bytes += 1;
-                    }
-                    (RawBytes { str, ref mut bytes }, None)
-                    if c >= 0x3FFF80 => {
-                        str.push((c - 0x3FFF00) as u8);
-                        *bytes += 4;
-                    }
-                    (_, Some(uni_c)) if uni_c.is_ascii() =>
-                        self.commit(Ascii { str: String::from(uni_c) }),
-                    (_, Some(uni_c)) =>
-                        self.commit(Unicode { str: String::from(uni_c), len: 1 }),
-                    (_, _) if c < 0x3FFF80 =>
-                        self.commit(NonUnicode { str: vec![c] }),
-                    (_, _) => self.commit(
-                        RawBytes { str: vec![(c - 0x3FFF00) as u8], bytes: 4 },
-                    ),
-                };
-            }
-            fn commit(&mut self, next: EStrSegment) {
-                let prev = replace(&mut self.state, next);
-                if !prev.is_empty() {
-                    self.vec.push(prev);
+                    partial
                 }
-            }
+            };
         }
-        let mut builder = Builder{ vec: Vec::default(), state: Default::default() };
-        debug_assert!(str.len().is_multiple_of(4));
-        let base = str.as_ptr();
-        for i in (0..str.len()).step_by(4) {
-            let c = unsafe { (base.add(i) as *const u32).read_unaligned() };
-            builder.push(c);
-        }
-        builder.commit(Empty);
-        builder.vec
+        OptimisticParseResult::Mixed(vec)
     }
 
-    /// Returns the length info in the form of `(len_chars, len_bytes)`
-    pub fn chars_bytes(&self) -> (usize, usize) {
+    /// Returns the total number of chars
+    pub fn chars(&self) -> usize {
         match self {
-            Empty => (0, 0),
-            Unicode { str, len } => (*len, str.len()),
-            Ascii { str } => (str.len(), str.len()),
-            RawBytes { str, bytes } => (str.len(), *bytes),
-            NonUnicode { str } => (str.len(), str.len()),
-            Widget { .. } => (1, 1),
+            Unicode { chars, .. } => *chars,
+            Ascii { str } => str.len(),
+            RawBytes { str, .. } => str.len(),
+            NonUnicode { c } => if *c < 0x3FFF80 { 1 } else { 4 },
+            Widget { .. } => 1,
+        }
+    }
+
+    /// Returns the total number of pango bytes
+    pub fn pango_bytes(&self) -> usize {
+        match self {
+            Unicode { str, .. } | Ascii { str } => str.len(),
+            RawBytes { pango, .. } => *pango,
+            NonUnicode { c } => if *c < 0x3FFF80 { 1 } else { 4 },
+            Widget { .. } => 1,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.chars_bytes().1
+        self.chars()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -155,7 +166,6 @@ impl EStrSegment {
     pub fn write(&self, bytes: &mut [u8]) {
         debug_assert!(bytes.len() == self.len());
         match self {
-            Empty => (),
             Unicode { str, .. } => bytes.copy_from_slice(str.as_bytes()),
             Ascii { str } => bytes.copy_from_slice(str.as_bytes()),
             RawBytes { str, .. } => {
@@ -169,158 +179,116 @@ impl EStrSegment {
                 }
                 debug_assert!(self.len() as u64 == writer.position());
             }
-            NonUnicode { .. } => bytes.fill(b' '),
+            NonUnicode { c } => {
+                debug_assert_eq!(bytes.len(), self.pango_bytes());
+                if *c < 0x3FFF80 {
+                    bytes.fill(b' ')
+                } else {
+                    let mut writer = Cursor::new(bytes);
+                    write!(writer, "\\{:3o}", c - 0x3FFF00).unwrap();
+                }
+            },
             Widget { .. } => bytes[0] = b' ',
         }
     }
 
-    pub fn split(&mut self, offset: usize) -> Self {
-        debug_assert!(offset != 0);
+    pub fn split(&mut self, char_offset: usize) -> Self {
+        debug_assert!(char_offset != 0 && char_offset <= self.chars());
         match self {
-            Empty => Empty,
-            Unicode { str, len } => {
-                let tail = str[offset..].to_string();
-                str.drain(offset..);
-                let tail_chars = tail.chars().count();
-                *len -= tail_chars;
-                Self::from_ascii_or(tail, tail_chars)
+            Unicode { str, chars } => {
+                let byte_offset = str_indices::chars::to_byte_idx(str, char_offset);
+                let tail = str[byte_offset..].to_string();
+                str.drain(byte_offset..);
+                let tail_chars = *chars - char_offset;
+                *chars = char_offset;
+                Self::from_counted_utf8(tail, tail_chars)
             }
             Ascii { str } => {
-                let tail = str[offset..].to_string();
-                str.drain(offset..);
+                let tail = str[char_offset..].to_string();
+                str.drain(char_offset..);
                 let len = tail.len();
-                Self::from_ascii_or(tail, len)
+                Self::from_counted_utf8(tail, len)
             }
-            RawBytes { str, bytes } => {
-                let tail = Self::from_raw(&str[offset..]);
-                *bytes -= tail.chars_bytes().0;
-                str.drain(offset..);
+            RawBytes { str, pango } => {
+                let tail = EStrSegment::from_raw(&str[char_offset..]);
+                *pango -= tail.pango_bytes();
+                str.drain(char_offset..);
                 tail
             }
-            NonUnicode { str } => {
-                let tail = NonUnicode { str: str[offset..].to_vec() };
-                str.drain(offset..);
-                tail
-            }
-            Widget { .. } => unreachable!(),
+            NonUnicode { .. } | Widget { .. } => unreachable!(),
+        }
+    }
+
+    pub fn char_offset_to_pango_offset(&self, char_offset: usize) -> usize {
+        match self {
+            Unicode { str, .. } => str_indices::chars::to_byte_idx(str, char_offset),
+            Ascii { .. } => char_offset,
+            RawBytes { str, .. } => raw_bytes_to_pango_byte_count(&str[..char_offset]),
+            NonUnicode { .. } => if char_offset == 0 { 0 } else { self.pango_bytes() },
+            Widget { .. } => char_offset,
+        }
+    }
+
+    pub fn pango_offset_to_char_offset(&self, pango_offset: usize) -> usize {
+        match self {
+            Unicode { str, .. } => str_indices::chars::from_byte_idx(str, pango_offset),
+            Ascii { .. } => pango_offset,
+            RawBytes { str, .. } => raw_bytes_pango_to_char_index(str, pango_offset).0,
+            NonUnicode { .. } => if pango_offset == 0 { 0 } else { 1 },
+            Widget { .. } => pango_offset,
         }
     }
 }
 
 impl Summable for EStrSegment {
-    type S = EStrMetrics;
+    type S = EStrInfo;
 
     fn summarize(&self) -> Self::S {
-        let (chars, bytes) =self.chars_bytes();
-        EStrMetrics { bytes, chars }
+        EStrInfo { chars: self.chars(), pango: self.pango_bytes() }
     }
 }
 
 impl RopePiece for EStrSegment {
     type Context = ();
-    const ABS: bool = false;
 
-    fn insert_or_split(&mut self, _: &mut Self::Context, other: Self, offset: &Self::S) -> SplitResult<Self> {
+    fn insert_or_split(&mut self, _: &mut Self::Context, other: Self, offset: usize) -> SplitResult<Self> {
+        assert!(!self.is_empty());
         if other.is_empty() {
             return SplitResult::Merged;
         }
-        if self.is_empty() {
-            *self = other;
-            return SplitResult::Merged;
+        if offset == self.chars() {
+            return SplitResult::TailSplit(other);
         }
-        let offset = offset.bytes;
-        match (self, &other) {
-            (
-                Unicode { str, len },
-                Unicode { str: str_o, len: len_o },
-            ) => {
-                if str.len() + str_o.len() > MAX_CHILD_LEN {
-                    if offset == 0 {
-                        return SplitResult::HeadSplit(other);
-                    }
-                    if offset == str.len() {
-                        return SplitResult::TailSplit(other);
-                    }
-
-                    let tail = str[offset..].to_string();
-                    let tail_chars = tail.chars().count();
-                    let tail = Self::from_ascii_or(tail, tail_chars);
-                    str.drain(offset..);
-                    return if str_o.len() >= MIN_CHILD_LEN {
-                        *len -= tail_chars;
-                        SplitResult::MiddleSplit(other, tail)
-                    } else {
-                        str.push_str(str_o);
-                        *len = *len + len_o - tail_chars;
-                        SplitResult::TailSplit(tail)
-                    };
-                }
-                str.insert_str(offset, str_o);
-                *len += len_o;
-                SplitResult::Merged
-            }
-            (
-                Ascii { str },
-                Ascii { str: str_o },
-            ) => {
-                str.insert_str(offset, str_o);
-                if str.len() > MAX_CHILD_LEN {
-                    let mid = str.len() / 2;
-                    let tail = str[mid..].to_string();
-                    str.drain(mid..);
-                    let len = tail.len();
-                    SplitResult::TailSplit(Self::from_ascii_or(tail, len))
-                } else {
-                    SplitResult::Merged
-                }
-            }
-            (this, _) => {
-                if offset == 0 {
-                    SplitResult::HeadSplit(other)
-                } else if offset == this.len() {
-                    SplitResult::TailSplit(other)
-                } else {
-                    SplitResult::MiddleSplit(other, this.split(offset))
-                }
-            }
-        }
+        let tail = self.split(offset);
+        SplitResult::MiddleSplit(other, tail)
     }
 
-    fn delete_range(&mut self, _: &mut Self::Context, from: &Self::S, to: &Self::S) -> DeleteResult<Self> {
-        let range = from.bytes..to.bytes;
-        match self {
-            Empty => unreachable!(),
-            Unicode { str, len } => {
-                str.drain(range);
-                *len -= to.chars - from.chars;
+    fn delete_range(&mut self, _: &mut Self::Context, range: Range<usize>) -> DeleteResult<Self> {
+        let bytes = match self {
+            Unicode { str, chars } => {
+                let byte_start = str_indices::chars::to_byte_idx(str, range.start);
+                let byte_end = str_indices::chars::to_byte_idx(str, range.end);
+                str.drain(byte_start..byte_end);
+                *chars -= range.len();
+                byte_end - byte_start
             }
-            Ascii { str } => { str.drain(range); }
-            RawBytes { str, bytes } => {
-                str.drain(from.chars..to.chars);
-                *bytes -= range.len();
-            }
-            NonUnicode { str } => { str.drain(range); }
-            Widget { .. } => unreachable!(),
-        }
-        let mut delta = *to;
-        delta.sub_assign(from);
-        DeleteResult::Updated(delta)
-    }
-
-    fn delete(&mut self, _context: &mut Self::Context) {
-    }
-
-    fn measure_offset(&self, _: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
-        let chars = match self {
-            Unicode { str, .. } => str[..base_offset].chars().count(),
-            RawBytes { str, .. } => raw_bytes_pango_to_index(str, base_offset).0,
-            Empty | Ascii { .. } | NonUnicode { .. } | Widget { .. } => base_offset,
+            Ascii { str } => { str.drain(range.clone()); range.len() }
+            RawBytes { str, pango } => {
+                let pango_bytes = raw_bytes_to_pango_byte_count(&str[range.clone()]);
+                str.drain(range.clone());
+                *pango -= pango_bytes;
+                pango_bytes
+            },
+            NonUnicode { .. } | Widget { .. } => unreachable!(),
         };
-        EStrMetrics { bytes: base_offset, chars }
+        DeleteResult::Updated(EStrInfo { chars: range.len(), pango: bytes })
+    }
+
+    fn notify_delete(&mut self, _context: &mut Self::Context) {
     }
 }
 
-pub(crate) fn raw_bytes_pango_to_index(str: &[u8], byte_index: usize) -> (usize, usize) {
+fn raw_bytes_pango_to_char_index(str: &[u8], byte_index: usize) -> (usize, usize) {
     let mut remaining = byte_index;
     let mut i = 0usize;
     for c in str {
@@ -334,226 +302,189 @@ pub(crate) fn raw_bytes_pango_to_index(str: &[u8], byte_index: usize) -> (usize,
     (i, remaining)
 }
 
-fn raw_bytes_pango_bytes(str: &[u8]) -> usize {
+/// Compute the required pango bytes for a raw byte slice
+fn raw_bytes_to_pango_byte_count(str: &[u8]) -> usize {
     str.iter().map(|c| if c.is_ascii() { 1 } else { 4 }).sum()
 }
 
-impl WithCharMetric for EStrSegment {
-    fn substring<F, R: Default>(
-        &self, _: &Self::Context,
-        range: std::ops::Range<usize>, _abs_base: usize,
-        mut f: F,
-    ) -> R where F: FnMut(&str, R) -> R {
-        let r = R::default();
-        match self {
-            Empty => r,
-            Unicode { str, .. } | Ascii { str } => f(&str[range], r),
-            NonUnicode { .. } => range.fold(r, |r, _| f("�", r)),
-            Widget { .. } => f("￼", r),
-            RawBytes { str, .. } => str[range].iter().fold(r, |r, c| {
-                if c.is_ascii() {
-                    let buf = [*c];
-                    f(str::from_utf8(&buf[..]).unwrap(), r)
-                } else {
-                    f("🔢", r)
-                }
-            }),
-        }
+fn next_emacs_codepoint(str: &[u8], i: usize) -> Option<(u32, usize)> {
+    let b1 = str[i];
+    let get = |i: usize| str.get(i).and_then(|c| if c & 0b1100_0000 == 0b1000_0000 {
+        Some(c)
+    } else {
+        None
+    });
+    Some(match b1 {
+        // ASCII
+        0x00..=0x7F => (b1 as u32, 1),
+        // Invalid starting byte
+        0x80..=0xBF => return None,
+        // Emacs eight-bit-char
+        0xC0..=0xC1 => (
+            0x3FFF80u32 | ((b1 & 1) << 6) as u32
+                | (get(i + 1)? & 0x3F) as u32, 2,
+        ),
+        // UTF-8 2-byte sequence
+        0xC2..=0xDF => (
+            ((b1 & 0x1F) as u32) << 6
+                | (get(i + 1)? & 0x3F) as u32, 2,
+        ),
+        // UTF-8 3-byte sequence
+        0xE0..=0xEF => (
+            ((b1 & 0xF) as u32) << 12
+                | ((get(i + 1)? & 0x3F) as u32) << 6
+                | ((get(i + 2)? & 0x3F) as u32),
+            3,
+        ),
+        // UTF-8 4-byte sequence
+        0xF0..=0xF7 => (
+            ((b1 & 0x7) as u32) << 18
+                | ((get(i + 1)? & 0x3F) as u32) << 12
+                | ((get(i + 2)? & 0x3F) as u32) << 6
+                | ((get(i + 3)? & 0x3F) as u32),
+            4,
+        ),
+        // Emacs 5-byte sequence
+        0xF8..=0xF8 => (
+            (((get(i + 1)? & 0x0F) as u32) << 18)
+                | ((get(i + 2)? & 0x3F) as u32) << 12
+                | ((get(i + 3)? & 0x3F) as u32) << 6
+                | ((get(i + 4)? & 0x3F) as u32),
+            4,
+        ),
+        // Invalid starting byte
+        _ => return None,
+    })
+}
+
+/// Metrics for Emacs string and the corresponding Pango string
+///
+/// When displaying Emacs strings, we need to convert them to
+/// a UTF-8 string that Pango accepts, while keeping it easy for
+/// modification. And this rope serves exactly this purpose.
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+pub struct EStrInfo {
+    /// The char count in this interval.
+    ///
+    /// See [str::chars].
+    pub(crate) chars: usize,
+    /// The encoded length in the Pango UTF-8 string
+    ///
+    /// For example, raw bytes are encoded as `\XXX`,
+    /// so each char corresponds to 4 bytes.
+    pub(crate) pango: usize,
+}
+
+impl Sum for EStrInfo {
+    fn len(&self) -> usize {
+        self.chars
     }
 
-    fn chars(sum: &Self::S) -> usize {
-        sum.chars
+    fn add_assign(&mut self, other: &Self) {
+        self.pango = self.pango.wrapping_add(other.pango);
+        self.chars = self.chars.wrapping_add(other.chars);
+    }
+
+    fn sub_assign(&mut self, other: &Self) {
+        self.pango = self.pango.wrapping_sub(other.pango);
+        self.chars = self.chars.wrapping_sub(other.chars);
+    }
+
+    fn identity() -> Self {
+        Self::default()
     }
 }
 
-pub mod metrics {
-    use roperig::piece::Sum;
+pub struct PangoMetric();
+impl Metric<EStrSegment> for PangoMetric {
+    fn measure(sum: &<EStrSegment as Summable>::S) -> usize {
+        sum.pango
+    }
+}
 
-    /// Metrics for Emacs string and the corresponding Pango string
-    ///
-    /// When displaying Emacs strings, we need to convert them to
-    /// a UTF-8 string that Pango accepts, while keeping it easy for
-    /// modification. And this rope serves exactly this purpose.
-    #[derive(Default, Copy, Clone, Eq, PartialEq)]
-    pub struct EStrMetrics {
-        /// The encoded length in the Pango UTF-8 string
-        ///
-        /// For example, raw bytes are encoded as `\XXX`,
-        /// so each char corresponds to 4 bytes.
-        pub(crate) bytes: usize,
-        /// The char count in this interval.
-        ///
-        /// See [str::chars].
-        pub(crate) chars: usize,
+#[cfg(test)]
+pub(crate) mod tests {
+    use roperig::metrics::BaseMetric;
+    use roperig::ropebase::RopeBase;
+    use roperig::roperig::Rope;
+    use crate::data::segment::{EStrSegment, OptimisticParseResult, PangoMetric};
+
+    fn simple_test_cases() -> Vec<(EStrSegment, usize, usize)> {
+        let mut vec = Vec::new();
+        let test_bytes = vec![1, 63, 128, 2, 64, 255];
+        vec.push((EStrSegment::from_ascii("hello!".as_bytes()), 6, 6));
+        vec.push((EStrSegment::from_raw("hello!".as_bytes()), 6, 6));
+        vec.push((EStrSegment::from_raw(&test_bytes), 12, 6));
+        let s = EStrSegment::from_emacs("😄😊".as_bytes());
+        match s {
+            OptimisticParseResult::Single(segment) =>
+                vec.push((segment, 8, 2)),
+            _ => panic!(),
+        }
+
+        for (_, bytes, chars) in &vec {
+            assert_eq!(0, bytes % 2);
+            assert_eq!(0, chars % 2);
+        }
+        vec
     }
 
-    impl Sum for EStrMetrics {
-        fn len(&self) -> usize {
-            self.bytes
-        }
+    #[test]
+    fn length_single() {
+        let assert_len = |s: EStrSegment, len: usize| {
+            let mut rope = RopeBase::default();
+            assert_eq!(len, s.len());
+            rope.init(Some(s).into_iter());
+            assert_eq!(len, rope.base_len());
+        };
 
-        fn add_assign(&mut self, other: &Self) {
-            self.bytes = self.bytes.wrapping_add(other.bytes);
-            self.chars = self.chars.wrapping_add(other.chars);
-        }
-
-        fn sub_assign(&mut self, other: &Self) {
-            self.bytes = self.bytes.wrapping_sub(other.bytes);
-            self.chars = self.chars.wrapping_sub(other.chars);
-        }
-
-        fn identity() -> Self {
-            Self::default()
+        for (segment, _, chars) in simple_test_cases() {
+            assert_len(segment, chars);
         }
     }
 
-    fn char_boundary_search<const INC: bool>(str: &str, offset: usize) -> usize {
-        let mut i = if INC { offset + 1 } else { offset - 1 };
-        while !str.is_char_boundary(i) {
-            i = if INC { i + 1 } else { i - 1 };
+    #[test]
+    fn base_metric_single() {
+        for (segment, bytes, chars) in simple_test_cases() {
+            let mut metrics = Rope::default();
+            metrics.insert(0, segment.clone());
+            assert_eq!(chars, metrics.base_len());
+            assert_eq!(bytes, metrics.len::<PangoMetric>());
+            assert_eq!(chars, metrics.len::<BaseMetric>());
         }
-        i
     }
 
-    #[cfg(test)]
-    pub(crate) mod tests {
-        use roperig::metrics::{BaseMetric, CharMetric};
-        use roperig::roperig::Rope;
-        use crate::data::segment::EStrSegment;
+    #[test]
+    fn metrics_multiple() {
+        let segments = simple_test_cases();
 
-        macro_rules! utf32_to_bytes_impl {
-            ($name:ident, $stride_shift:expr, $ptr_type:ty) => {
-                pub fn $name(from: &[$ptr_type]) -> &[u8] {
-                    let len = from.len() << $stride_shift;
-                    let ptr: *const u8 = from.as_ptr().cast();
-                    unsafe { std::slice::from_raw_parts(ptr, len) }
+        let mut indices = [0usize, 0, 0];
+        let inc = |indices: &mut [usize]| -> bool {
+            for i in indices.iter_mut() {
+                if *i < segments.len() - 1 {
+                    *i += 1;
+                    return true;
                 }
-            };
-        }
-        utf32_to_bytes_impl!(utf32_stride2_to_bytes, 1, u16);
-        utf32_to_bytes_impl!(utf32_stride4_to_bytes, 2, u32);
-
-        fn simple_test_cases() -> Vec<(EStrSegment, usize, usize)> {
-            let mut vec = Vec::new();
-            let test_bytes = vec![1, 63, 128, 2, 64, 255];
-            vec.push((EStrSegment::from_ascii("hello!".as_bytes()), 6, 6));
-            vec.push((EStrSegment::from_raw("hello!".as_bytes()), 6, 6));
-            vec.push((EStrSegment::from_raw(&test_bytes), 12, 6));
-
-            vec.push((EStrSegment::from_utf32_stride1("hello!".as_bytes()), 6, 6));
-            vec.push((EStrSegment::from_utf32_stride1(&test_bytes), 8, 6));
-
-            let stride2: Vec<u16> = "hello!".as_bytes().iter().map(|c| *c as u16).collect();
-            vec.push((EStrSegment::from_utf32_stride2(utf32_stride2_to_bytes(&stride2)), 6, 6));
-            let stride2: Vec<u16> = test_bytes.iter().map(|c| *c as u16).collect();
-            vec.push((EStrSegment::from_utf32_stride2(utf32_stride2_to_bytes(&stride2)), 8, 6));
-            let stride2 = vec![1, 128, 0xFFF, 2, 255, 0xFFFF];
-            vec.push((EStrSegment::from_utf32_stride2(utf32_stride2_to_bytes(&stride2)), 12, 6));
-
-            let stride4: Vec<u32> = "hello!".as_bytes().iter().map(|c| *c as u32).collect();
-            vec.push((EStrSegment::from_utf32_stride4(utf32_stride4_to_bytes(&stride4)), 6, 6));
-            let stride4: Vec<u32> = test_bytes.iter().map(|c| *c as u32).collect();
-            vec.push((EStrSegment::from_utf32_stride4(utf32_stride4_to_bytes(&stride4)), 8, 6));
-            let stride4: Vec<u32> = stride2.iter().map(|c| *c as u32).collect();
-            vec.push((EStrSegment::from_utf32_stride4(utf32_stride4_to_bytes(&stride4)), 12, 6));
-            let stride4 = vec![1, 128, 0xFFF, 0x10000, 2, 255, 0xFFFF, 0x10FFFF];
-            vec.push((EStrSegment::from_utf32_stride4(utf32_stride4_to_bytes(&stride4)), 20, 8));
-
-            let non_unicode = vec![0x110000, 0x3FFF00];
-            let emacs = EStrSegment::from_emacs(utf32_stride4_to_bytes(&non_unicode));
-            assert_eq!(1, emacs.len());
-            vec.push((emacs[0].clone(), 2, 2));
-            let raw_bytes = vec![0x3FFF80, 0x3FFFFF];
-            let emacs = EStrSegment::from_emacs(utf32_stride4_to_bytes(&raw_bytes));
-            assert_eq!(1, emacs.len());
-            vec.push((emacs[0].clone(), 8, 2));
-
-            for (_, bytes, chars) in &vec {
-                assert_eq!(0, bytes % 2);
-                assert_eq!(0, chars % 2);
+                *i = 0;
             }
-            vec
-        }
+            false
+        };
 
-        #[test]
-        fn length_single() {
-            let assert_len = |s: EStrSegment, len: usize| {
-                let mut rope = Rope::default();
-                assert_eq!(len, s.len());
-                rope.insert(0, s);
-                assert_eq!(len, rope.len());
-            };
-
-            for (segment, bytes, _) in simple_test_cases() {
-                assert_len(segment, bytes);
-            }
-        }
-
-        fn test_metrics(rope: &Rope<EStrSegment>, chars: usize) {
-            for index in 0..=chars {
-                assert_eq!(Some(index), rope.convert_metrics::<CharMetric, CharMetric>(index));
-                let byte_index = rope.convert_metrics::<CharMetric, BaseMetric>(index);
-                assert_eq!(byte_index, rope.convert_metrics::<BaseMetric, BaseMetric>(byte_index.unwrap()));
-                let char_index = rope.convert_metrics::<BaseMetric, CharMetric>(byte_index.unwrap());
-                assert_eq!(Some(index), char_index);
-            }
-        }
-
-        type ByteMetric = BaseMetric;
-
-        #[test]
-        fn base_metric_single() {
-            for (segment, bytes, chars) in simple_test_cases() {
-                let mut metrics = Rope::default();
-                metrics.insert(0, segment.clone());
-                assert_eq!(bytes, metrics.len());
-                assert_eq!(bytes, metrics.measure::<ByteMetric>());
-                assert_eq!(chars, metrics.measure::<CharMetric>());
-                assert_eq!(
-                    Some(bytes / 2), metrics.convert_metrics::<CharMetric, ByteMetric>(chars / 2),
-                    "{:?}@(char){}", segment, chars / 2,
-                );
-                assert_eq!(
-                    Some(chars / 2), metrics.convert_metrics::<ByteMetric, CharMetric>(bytes / 2),
-                    "{:?}@(byte){}", segment, bytes / 2,
-                );
-                test_metrics(&metrics, chars);
-            }
-        }
-
-        #[test]
-        fn metrics_multiple() {
-            let segments = simple_test_cases();
-
-            let mut indices = [0usize, 0, 0];
-            let inc = |indices: &mut [usize]| -> bool {
-                for i in indices.iter_mut() {
-                    if *i < segments.len() - 1 {
-                        *i += 1;
-                        return true;
-                    }
-                    *i = 0;
-                }
-                false
-            };
-
-            loop {
-                let mut bytes = 0;
-                let mut chars = 0;
-                let mut metrics = Rope::default();
-                indices.iter().map(|i| &segments[*i]).for_each(
-                    |(segment, delta_bytes, delta_chars)| {
-                        bytes += delta_bytes;
-                        chars += delta_chars;
-                        metrics.insert(metrics.len(), segment.clone());
-                    });
-                assert_eq!(bytes, metrics.len());
-                assert_eq!(bytes, metrics.measure::<ByteMetric>());
-                assert_eq!(chars, metrics.measure::<CharMetric>());
-                test_metrics(&metrics, chars);
-                if !inc(&mut indices) {
-                    break;
-                }
+        loop {
+            let mut bytes = 0;
+            let mut chars = 0;
+            let mut metrics = Rope::default();
+            indices.iter().map(|i| &segments[*i]).for_each(
+                |(segment, delta_bytes, delta_chars)| {
+                    bytes += delta_bytes;
+                    chars += delta_chars;
+                    metrics.insert(metrics.base_len(), segment.clone());
+                });
+            assert_eq!(chars, metrics.base_len());
+            assert_eq!(bytes, metrics.len::<PangoMetric>());
+            assert_eq!(chars, metrics.len::<BaseMetric>());
+            if !inc(&mut indices) {
+                break;
             }
         }
     }
