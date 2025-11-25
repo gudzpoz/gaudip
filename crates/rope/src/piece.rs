@@ -1,4 +1,5 @@
-use crate::{metrics::Metric, rb_base::SafeRef};
+use std::ops::Range;
+use crate::rb_base::SafeRef;
 
 /// Summary for a [Summable]
 ///
@@ -41,23 +42,6 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
         zero.sub_assign(self);
         zero
     }
-
-    /// Returns a copy of the added sum
-    fn add(&self, other: &Self) -> Self {
-        let mut sum = *self;
-        sum.add_assign(other);
-        sum
-    }
-}
-/// A simple trait to avoid generic brackets
-pub trait Measured<T: RopePiece> {
-    /// Returns the measurement in [Metric]
-    fn get<M: Metric<T>>(&self) -> usize;
-}
-impl<T: RopePiece> Measured<T> for T::S {
-    fn get<M: Metric<T>>(&self) -> usize {
-        M::measure(self)
-    }
 }
 
 /// A type with some length properties
@@ -78,10 +62,7 @@ pub enum SplitResult<T: RopePiece> {
     /// Meaning: the supplied piece has been merged into this node
     Merged,
     /// Meaning: The returned value is the unmerged portion and should
-    /// be inserted in front of this node.
-    HeadSplit(T),
-    /// Similar to [SplitResult::HeadSplit], but returned only when
-    /// the insertion should happen at the tail end.
+    /// be inserted after this node.
     TailSplit(T),
     /// Meaning: The unmerged portion causes the node to split.
     /// As a result, the current node should be split in place,
@@ -112,14 +93,6 @@ pub enum DeleteResult<T: RopePiece> {
 /// If the user wishes for a more flexible API (for, for example, expressing
 /// mergeability, zero-width nodes, etc.), they are expected to use the [Cursor]
 /// API instead.
-///
-/// The `ABS` parameter is used to indicate whether the [Self::measure_offset]
-/// function should be passed an additional absolute offset. If `false`, `0` is
-/// passed as the argument.
-///
-/// TODO: The `ABS` parameter currently makes the rope computes absolute offsets
-///       on the fly. Instead, we might want to cache them or allow the user to
-///       supply an externally kept one. This is mainly for gap buffers.
 pub trait RopePiece: Summable + Sized {
     /// Context object for rope pieces
     ///
@@ -132,10 +105,6 @@ pub trait RopePiece: Summable + Sized {
     ///
     /// [piece tree]: https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
     type Context;
-    /// Whether the API should pass absolute offsets as an additional argument.
-    ///
-    /// For example, gap buffer implementations might need this.
-    const ABS: bool;
 
     /// Try to insert a new piece into the current piece
     ///
@@ -143,26 +112,16 @@ pub trait RopePiece: Summable + Sized {
     ///
     /// When the piece gets merged, the method should return [SplitResult::Merged].
     fn insert_or_split(
-        &mut self, context: &mut Self::Context,
-        other: Self, offset: &Self::S,
+        &mut self, context: &mut Self::Context, other: Self, offset: usize,
     ) -> SplitResult<Self>;
-    /// Delete a portion from the current piece and return [Sum] of the deleted part
+    /// Delete a portion from the current piece and return a summary of the deleted part
     fn delete_range(
-        &mut self, context: &mut Self::Context,
-        from: &Self::S, to: &Self::S,
+        &mut self, context: &mut Self::Context, range: Range<usize>,
     ) -> DeleteResult<Self>;
     /// Delete the entire piece
     ///
     /// This is mainly for any deallocation logic that should happen in the contexts.
-    fn delete(&mut self, context: &mut Self::Context);
-
-    /// Returns the relative metrics at the given offset
-    ///
-    /// Note that `abs_base_offset` is always zero unless `Abs` is true.
-    fn measure_offset(
-        &self, context: &Self::Context,
-        base_offset: usize, abs_base_offset: usize,
-    ) -> Self::S;
+    fn notify_delete(&mut self, context: &mut Self::Context);
 }
 
 /// A reference to internal nodes, inherently unsafe

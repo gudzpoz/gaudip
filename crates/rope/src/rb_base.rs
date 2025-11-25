@@ -117,12 +117,6 @@ impl<T: Summable> RbSlab<T> {
         let (n1, n2) = self.slab.get2_mut(idx1, idx2).unwrap();
         (&mut n1.rb, &mut n2.rb)
     }
-    pub fn get2_mut(&mut self, idx1: SafeRef, idx2: SafeRef) -> (&mut Node<T>, &mut Node<T>) {
-        let idx1 = idx1.get();
-        let idx2 = idx2.get();
-        let (n1, n2) = self.slab.get2_mut(idx1, idx2).unwrap();
-        (n1, n2)
-    }
 
     fn adopt(&mut self, parent: SafeRef, red: bool, left: Ref, right: Ref) {
         self[parent].rb.red = red;
@@ -185,8 +179,8 @@ impl<T: Summable> RbSlab<T> {
     ///
     /// It basically follows the `buildFromSorted` method from
     /// OpenJDK `TreeMap`.
-    pub fn build_from_sorted<I>(&mut self, size: usize, nodes: &mut I) -> Option<(SafeRef, T::S)>
-    where I: Iterator<Item = T> {
+    pub fn build_from_sorted<I>(&mut self, nodes: &mut I) -> Option<(SafeRef, T::S)>
+    where I: ExactSizeIterator<Item = T> {
         fn build_from_sorted_rec<T: Summable, I>(
             // manual captures
             this: &mut RbSlab<T>, red_level: usize, nodes: &mut I,
@@ -234,6 +228,7 @@ impl<T: Summable> RbSlab<T> {
         }
 
         // self.compact();
+        let size = nodes.len();
         let red_level = (usize::BITS - 1 - (size + 1).leading_zeros()) as usize;
         build_from_sorted_rec(self, red_level, nodes, 0, 0, size - 1)
     }
@@ -254,7 +249,7 @@ pub struct RbNode {
 /// the portion of it can be accessed.
 ///
 /// This is reflected in the [Index] and [IndexMut] API. Basically:
-/// - [SafeRef] never points to sentinel and is used for [Index] to 
+/// - [SafeRef] never points to sentinel and is used for [Index] to
 ///   retrieve [Node].
 /// - [Ref] can point to sentinel, and should only be used within this
 ///   very file manipulating rb-tree structures ([RbNode]).
@@ -312,19 +307,35 @@ macro_rules! foreach_parent {
                 debug_assert!(Some($x) == $tree.root());
                 break None;
             };
+            let $pn = &$tree[$p];
+            $what;
+            $x = $p;
+        }
+    }};
+}
+pub(crate) use foreach_parent;
+macro_rules! foreach_parent_mut {
+    (({ $p:ident: $pn:ident } of { $x:ident: $n:ident } in $tree:expr) $what:block) => {{
+        let mut $x: SafeRef = $x;
+        loop {
+            let $n = &$tree[$x];
+            let parent = $n.rb.parent;
+            let Some($p) = parent else {
+                debug_assert!(Some($x) == $tree.root());
+                break None;
+            };
             let $pn = &mut $tree[$p];
             $what;
             $x = $p;
         }
     }};
     (({ $p:ident: $pn:ident } of $x:ident in $tree:expr) $what:block) => {
-        foreach_parent!(({ $p: $pn } of { $x: x_node } in $tree) $what)
+        foreach_parent_mut!(({ $p: $pn } of { $x: x_node } in $tree) $what)
     };
     (($pn:ident of $x:ident in $tree:expr) $what:block) => {
-        foreach_parent!(({ parent: $pn } of $x in $tree) $what)
+        foreach_parent_mut!(({ parent: $pn } of $x in $tree) $what)
     };
 }
-pub(crate) use foreach_parent;
 
 impl<T: Summable> RbSlab<T> {
     pub fn next(&self, mut this: SafeRef, dir: usize) -> Ref {
@@ -584,7 +595,7 @@ impl<T: Summable> RbSlab<T> {
 
     fn recompute_sum(&mut self, x: Ref) {
         let Some(x) = x else { return };
-        let Some(x) = foreach_parent!(({ p: pn } of x in self) {
+        let Some(x) = foreach_parent_mut!(({ p: pn } of x in self) {
             if Some(x) != pn.rb.children[1] {
                 x = p;
                 break Some(x);
@@ -602,7 +613,7 @@ impl<T: Summable> RbSlab<T> {
     }
 
     pub fn update_metadata(&mut self, x: SafeRef, delta: &T::S) {
-        let _: Option<()> = foreach_parent!((pn of x in self) {
+        let _: Option<()> = foreach_parent_mut!((pn of x in self) {
             if pn.rb.children[0] == Some(x) {
                 pn.left_sum.add_assign(delta);
             }
@@ -740,8 +751,9 @@ impl<T: Summable> RbSlab<T> {
     /// Batch insert a bunch of nodes (`size >= 2`)
     ///
     /// The `size` must be the length of the iterator.
-    pub fn batch_insert<I>(&mut self, at: SafeRef, side: usize, size: usize, mut values: I) -> T::S
-    where I: Iterator<Item = T> {
+    pub fn batch_insert<I>(&mut self, at: SafeRef, side: usize, values: &mut I) -> T::S
+    where I: ExactSizeIterator<Item = T> {
+        let size = values.len();
         assert!(size >= 2);
 
         // our join function requires a left tree, a joiner node and a right tree.
@@ -754,10 +766,9 @@ impl<T: Summable> RbSlab<T> {
         let first = self.insert(Node::new(first));
 
         // everything in between
+        let mut mid = values.by_ref().take(size - 2);
         let (new, mid_sum) =
-            if size > 2 && let Some((new, mid_sum)) = self.build_from_sorted(
-                size - 2, &mut values
-            ) {
+            if size > 2 && let Some((new, mid_sum)) = self.build_from_sorted(&mut mid) {
                 (Some(new), mid_sum)
             }
             else {
@@ -831,12 +842,6 @@ use std::collections::VecDeque;
 impl<T: Summable> RbSlab<T> {
     pub fn slab(&self, i: usize) -> &Node<T> {
         &self.slab[i]
-    }
-    pub fn slab_get(&self, i: usize) -> Option<&Node<T>> {
-        self.slab.get(i)
-    }
-    pub fn slab_len(&self) -> usize {
-        self.slab.len()
     }
 
     pub fn is_valid(&self) -> T::S {
@@ -921,8 +926,7 @@ impl<T: Summable> RbSlab<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{BaseMetric, CursorPos};
-    use crate::roperig::Rope;
+    use crate::roperig::{CursorPos, Rope};
     use crate::roperig_test::Alphabet;
     use rand::Rng;
     use rand_chacha::rand_core::SeedableRng;
@@ -995,7 +999,6 @@ mod tests {
         for count in [10, 100, 1000, 5000] {
             let mut rb: RbSlab<Alphabet> = RbSlab::new();
             rb.root = rb.build_from_sorted(
-                count,
                 &mut (0..count).map(|i| {
                     char::from_u32(('a' as usize + i) as u32).unwrap().into()
                 }),
@@ -1023,11 +1026,10 @@ mod tests {
         rb.insert(1, "b".into());
         rb.insert(2, "c".into());
 
-        let c = rb.cursor::<BaseMetric>(0).unwrap().inner();
-        rb.insert_many_before(
-            Some(&c),
-            3,
-            "def".chars().map(|c| c.to_string().into()),
+        let c = rb.cursor_at(0).unwrap();
+        c.insert_many_before(
+            &mut rb.tree,
+            &mut "def".chars().collect::<Vec<_>>().into_iter().map(|c| c.to_string().into()),
         );
         assert_eq!("defabc", rb.substring(0, 6));
     }
@@ -1040,11 +1042,10 @@ mod tests {
         rb.insert(2, "c".into());
         rb.insert(3, "d".into());
 
-        let c = rb.cursor::<BaseMetric>(2).unwrap().inner();
-        rb.insert_many_after(
-            Some(&c),
-            3,
-            "def".chars().map(|c| c.to_string().into()),
+        let c = rb.cursor_at(2).unwrap();
+        c.insert_many_after(
+            &mut rb.tree,
+            &mut "def".chars().collect::<Vec<_>>().into_iter().map(|c| c.to_string().into()),
         );
         assert_eq!("abdefc", rb.substring(0, 6));
     }
@@ -1060,26 +1061,25 @@ mod tests {
         let chars: Vec<String> = (0..count).map(|i| {
             char::from_u32('0' as u32 + i as u32).unwrap().to_string()
         }).collect();
-        let c = rb.cursor::<BaseMetric>(2).unwrap().inner();
-        rb.insert_many_after(
-            Some(&c),
-            count,
-            chars.iter().map(|c| c.clone().into()),
+        let c = rb.cursor_at(2).unwrap();
+        c.insert_many_after(
+            &mut rb.tree,
+            &mut chars.iter().map(|c| c.clone().into()),
         );
 
-        rb.is_valid();
+        rb.tree.is_valid();
         assert_eq!(
             "ab".to_string() + &chars.join("") + "c",
             rb.substring(0, 3 + count),
         );
-        assert_eq!(3 + count, rb.len());
+        assert_eq!(3 + count, rb.base_len());
 
-        let start = rb.cursor::<BaseMetric>(2).unwrap().inner();
-        let end = rb.cursor::<BaseMetric>(rb.len() - 1).unwrap().inner();
-        rb.delete_many_to(start, end);
+        let start = rb.cursor_at(2).unwrap();
+        let end = rb.cursor_at(rb.base_len() - 1).unwrap();
+        start.delete_many_to(&mut rb.tree, end, |_| {});
 
-        rb.is_valid();
-        assert_eq!(2, rb.len());
+        rb.tree.is_valid();
+        assert_eq!(2, rb.base_len());
         assert_eq!("ac", rb.substring(0, 2));
 
         let inner = rb.compact();
@@ -1096,11 +1096,11 @@ mod tests {
         rb.insert(2, "c".into());
         rb.insert(3, "d".into());
         rb.insert(4, "e".into());
-        let start = rb.cursor::<BaseMetric>(1).unwrap().inner();
-        let end = rb.cursor::<BaseMetric>(2).unwrap().inner();
-        rb.is_valid();
-        rb.delete_many_to(start, end);
-        rb.is_valid();
+        let start = rb.cursor_at(1).unwrap();
+        let end = rb.cursor_at(2).unwrap();
+        rb.tree.is_valid();
+        start.delete_many_to(&mut rb.tree, end, |_| {});
+        rb.tree.is_valid();
         assert_eq!("cde", rb.substring(0, 3));
     }
 
@@ -1111,20 +1111,20 @@ mod tests {
             rb.insert(0, "a".into());
             rb.insert(1, "b".into());
             rb.insert(2, "c".into());
-            let start = rb.cursor::<BaseMetric>(0).unwrap().inner();
-            let end = rb.cursor::<BaseMetric>(rb.len()).unwrap().inner();
+            let start = rb.cursor_at(0).unwrap();
+            let end = rb.cursor_at(rb.base_len()).unwrap();
             let (start, end) = if reverse {
                 (end, start)
             } else {
                 (start, end)
             };
-            rb.is_valid();
-            rb.delete_many_to(start, end);
-            rb.is_valid();
+            rb.tree.is_valid();
+            start.delete_many_to(&mut rb.tree, end, |_| {});
+            rb.tree.is_valid();
             if reverse {
-                assert_eq!("ac", rb.substring(0, rb.len()));
+                assert_eq!("ac", rb.substring(0, rb.base_len()));
             } else {
-                assert_eq!("", rb.substring(0, rb.len()));
+                assert_eq!("", rb.substring(0, rb.base_len()));
                 assert!(rb.is_empty());
             }
         }
@@ -1143,32 +1143,35 @@ mod tests {
                     .map(|_| rng.random_range('a'..='z')).collect();
                 let at = rng.random_range(0..=expected.len());
                 expected.insert_str(at, &s);
-                let cursor = rb.cursor::<BaseMetric>(at).map(|c| c.inner());
+                let cursor = rb.cursor_at(at);
                 let c = cursor.as_ref();
-                if at == 0 {
-                    rb.insert_many_before(c, s.len(), s.chars().map(|c| c.into()));
+                if let Some(c) = c {
+                    if at == 0 {
+                        c.insert_many_before(&mut rb.tree, &mut s.chars().collect::<Vec<_>>().into_iter().map(|c| c.into()));
+                    } else {
+                        c.insert_many_after(&mut rb.tree, &mut s.chars().collect::<Vec<_>>().into_iter().map(|c| c.into()));
+                    }
                 } else {
-                    rb.insert_many_after(c, s.len(), s.chars().map(|c| c.into()));
+                    rb.tree.init(s.chars().collect::<Vec<_>>().into_iter().map(|c| c.into()));
                 }
             } else {
                 let from = rng.random_range(0..expected.len());
                 let to = rng.random_range((from+1)..=expected.len());
                 expected.drain(from..to);
-                let mut c1 = rb.cursor::<BaseMetric>(from).unwrap();
+                let mut c1 = rb.cursor_at(from).unwrap();
                 if from != 0 {
-                    c1.next_piece();
+                    c1 = c1.next_piece(&rb.tree).unwrap();
                 }
-                let c1 = c1.inner();
-                let c2 = rb.cursor::<BaseMetric>(to).unwrap().inner();
-                rb.delete_many_to(c1, c2);
+                let c2 = rb.cursor_at(to).unwrap();
+                c1.delete_many_to(&mut rb.tree, c2, |_| {});
             }
-            rb.is_valid();
+            rb.tree.is_valid();
             if expected.is_empty() {
                 assert!(rb.is_empty());
             } else {
                 let from = rng.random_range(0..expected.len());
                 let to = rng.random_range(from..=expected.len());
-                assert_eq!(expected.len(), rb.len());
+                assert_eq!(expected.len(), rb.base_len());
                 assert_eq!(&expected[from..to], rb.substring(from, to));
             }
         }

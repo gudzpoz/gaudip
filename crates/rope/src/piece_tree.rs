@@ -1,7 +1,6 @@
-use crate::metrics::WithCharMetric;
 use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
-use crate::string::RopeContainer;
+use crate::string::{RopeContainer, WithCharMetric};
 use std::mem;
 use std::ops::Range;
 
@@ -67,13 +66,8 @@ impl Summable for TreePiece {
     }
 }
 impl WithCharMetric for TreePiece {
-    fn substring<F, R: Default>(&self, ctx: &Self::Context, range: Range<usize>, _abs: usize, mut f: F) -> R
-    where
-        F: FnMut(&str, R) -> R
-    {
-        let s = &ctx[self.buffer]
-            .buffer[self.buffer_offset + range.start..self.buffer_offset + range.end];
-        f(s, R::default())
+    fn get<'a>(&self, ctx: &'a Self::Context) -> &'a str {
+        &ctx[self.buffer].buffer[self.buffer_offset..self.buffer_offset + self.sum.length]
     }
 
     fn chars(sum: &TreeSum) -> usize {
@@ -100,15 +94,11 @@ const MAX_PIECE_LEN: usize = 256;
 
 impl RopePiece for TreePiece {
     type Context = Vec<TreeBuffer>;
-    const ABS: bool = false;
 
     fn insert_or_split(
-        &mut self, context: &mut Self::Context, other: Self, offset: &Self::S,
+        &mut self, context: &mut Self::Context, other: Self, offset: usize,
     ) -> SplitResult<Self> {
-        let offset = offset.len();
-        if offset == 0 {
-            SplitResult::HeadSplit(other)
-        } else if offset == self.len() {
+        if offset == self.len() {
             if other.buffer == self.buffer
                 && self.len() < MAX_PIECE_LEN
                 && other.buffer_offset == self.buffer_offset + self.len() {
@@ -123,16 +113,16 @@ impl RopePiece for TreePiece {
         }
     }
 
-    fn delete_range(&mut self, context: &mut Self::Context, from: &Self::S, to: &Self::S) -> DeleteResult<Self> {
-        let from = from.len();
-        let to = to.len();
+    fn delete_range(&mut self, context: &mut Self::Context, range: Range<usize>) -> DeleteResult<Self> {
+        let from = range.start;
+        let to = range.end;
         if from == 0 {
             let remaining = self.split(context, to);
             let del = mem::replace(self, remaining);
             DeleteResult::Updated(del.summarize())
         } else if to == self.len() {
             let mut del = self.split(context, from);
-            del.delete(context);
+            del.notify_delete(context);
             DeleteResult::Updated(del.summarize())
         } else {
             let split = self.split(context, to);
@@ -144,18 +134,11 @@ impl RopePiece for TreePiece {
         }
     }
 
-    fn delete(&mut self, context: &mut Self::Context) {
+    fn notify_delete(&mut self, context: &mut Self::Context) {
         let buffer = &mut context[self.buffer].buffer;
         if self.buffer_offset + self.len() == buffer.len() {
             buffer.truncate(self.buffer_offset);
         }
-    }
-
-    fn measure_offset(&self, context: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
-        let buffer = &context[self.buffer].buffer;
-        TreeSum::summarize(
-            &buffer[self.buffer_offset..self.buffer_offset + base_offset],
-        )
     }
 }
 
@@ -201,17 +184,8 @@ impl PieceTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roperig_test::{test_simple_string_fuzz, FuzzOp};
     use rand::Rng;
-    use rand_chacha::rand_core::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
-
-    fn rand_char_pos(rng: &mut ChaCha8Rng, s: &str) -> usize {
-        let mut at = rng.random_range(0..=s.len());
-        while !s.is_char_boundary(at) {
-            at += 1;
-        }
-        at
-    }
 
     #[test]
     fn test_simple_delete() {
@@ -231,39 +205,23 @@ mod tests {
 
     #[test]
     fn test_many_ops() {
-        let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut pt = PieceTree::new();
-        let mut expected = String::default();
-        let mut random_s = String::default();
-        for _ in 0..100000 {
-            let insert = pt.is_empty() || rng.random_bool(0.5);
-            if insert {
-                let at = rand_char_pos(&mut rng, &expected);
-                let len = rng.random_range(0..=64);
-                random_s.clear();
-                (0..len)
-                    .map(|_| if rng.random_bool(0.5) {
-                        rng.random_range('a'..='z')
-                    } else {
-                        rng.random_range('一'..='😄')
-                    }).for_each(|c| random_s.push(c));
-                expected.insert_str(at, &random_s);
-                pt.insert(at, &random_s);
-            } else {
-                let from = rand_char_pos(&mut rng, &expected);
-                let len = rand_char_pos(&mut rng, &expected[from..]);
-                expected.drain(from..from+len);
-                pt.delete_bytes(from..from+len);
+        test_simple_string_fuzz(move |op, expected, rng| {
+            match op {
+                FuzzOp::Insert(at, s) => pt.insert(at, &s),
+                FuzzOp::Delete(r) => pt.delete_bytes(r),
             }
             assert_eq!(pt.is_empty(), pt.len() == 0);
             assert_eq!(pt.is_empty(), pt.char_len() == 0);
-            let from = rng.random_range(0..=pt.char_len());
-            let to = rng.random_range(from..=pt.char_len());
-            let from = pt.char_to_byte(from);
-            let to = pt.char_to_byte(to);
+            let from_chars = rng.random_range(0..=pt.char_len());
+            let to_chars = rng.random_range(from_chars..=pt.char_len());
+            let from = pt.char_to_byte(from_chars);
+            let to = pt.char_to_byte(to_chars);
+            assert_eq!(from_chars, pt.byte_to_char(from));
+            assert_eq!(to_chars, pt.byte_to_char(to));
             assert_eq!(pt.substring(from..to), expected[from..to]);
             assert_eq!(expected.len(), pt.len());
-            pt.tree.is_valid();
-        }
+            pt.tree.tree.is_valid();
+        }, true);
     }
 }

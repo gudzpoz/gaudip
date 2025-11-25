@@ -1,9 +1,8 @@
 use std::ops::Range;
 
-use crate::metrics::{CharMetric, WithCharMetric};
 use crate::piece::{DeleteResult, RopePiece, SplitResult, Sum, Summable};
 use crate::roperig::Rope;
-use crate::string::RopeContainer;
+use crate::string::{RopeContainer, WithCharMetric};
 
 /// A wrapper around a [String], with precalculated stats.
 pub struct StringExt<Ext: Sum + FromStr> {
@@ -79,12 +78,8 @@ impl<Ext: Sum + FromStr> Summable for StringExt<Ext> {
 }
 
 impl<Ext: Sum + FromStr> WithCharMetric for StringExt<Ext> {
-    fn substring<F, R: Default>(&self, _context: &Self::Context, range: Range<usize>, _abs: usize, mut f: F) -> R
-    where
-        F: FnMut(&str, R) -> R
-    {
-        let s = &self.s[range];
-        f(s, R::default())
+    fn get<'a>(&'a self, _context: &'a Self::Context) -> &'a str {
+        &self.s
     }
 
     fn chars(sum: &StringSum<Ext>) -> usize {
@@ -108,16 +103,10 @@ impl<Ext: Sum + FromStr> RopeContainer<StringExt<Ext>> for StringRope<Ext> {
 
 impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
     type Context = ();
-    const ABS: bool = false;
 
-    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Self, offset: &Self::S) -> SplitResult<Self> {
-        let offset = offset.len();
+    fn insert_or_split(&mut self, _context: &mut Self::Context, other: Self, offset: usize) -> SplitResult<Self> {
         let len = self.s.len() + other.s.len();
-        if offset == 0 {
-            if len > MAX_PIECE_SIZE {
-                return SplitResult::HeadSplit(other);
-            }
-        } else if offset == self.s.len() {
+        if offset == self.s.len() {
             if len > MAX_PIECE_SIZE {
                 return SplitResult::TailSplit(other);
             }
@@ -150,12 +139,14 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
         SplitResult::Merged
     }
 
-    fn delete_range(&mut self, _context: &mut Self::Context, from: &Self::S, to: &Self::S) -> DeleteResult<Self> {
-        let from = from.len();
-        let to = to.len();
+    fn delete_range(&mut self, _context: &mut Self::Context, range: Range<usize>) -> DeleteResult<Self> {
+        let from = range.start;
+        let to = range.end;
         let extra = Ext::from_str(&self.s[from..to]);
         let chars = self.s[from..to].chars().count();
         self.s.drain(from..to);
+        self.chars -= chars;
+        self.extra.sub_assign(&extra);
         DeleteResult::Updated(StringSum {
             bytes: to - from,
             chars,
@@ -163,15 +154,7 @@ impl<Ext: Sum + FromStr> RopePiece for StringExt<Ext> {
         })
     }
 
-    fn delete(&mut self, _context: &mut Self::Context) {
-    }
-
-    fn measure_offset(&self, _context: &Self::Context, base_offset: usize, _abs: usize) -> Self::S {
-        StringSum {
-            bytes: base_offset,
-            chars: self.s[..base_offset].chars().count(),
-            extra: Ext::from_str(&self.s[..base_offset]),
-        }
+    fn notify_delete(&mut self, _context: &mut Self::Context) {
     }
 }
 
@@ -182,18 +165,6 @@ impl<Ext: Sum + FromStr> Default for StringRope<Ext> {
 }
 
 impl<Ext: Sum + FromStr> StringRope<Ext> {
-    /// Returns the length of the rope in bytes
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    /// Returns the length of the rope in characters
-    pub fn chars(&self) -> usize {
-        self.0.measure::<CharMetric>()
-    }
-    /// Returns true if the rope is empty
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
     /// Inserts a string at the given byte offset
     pub fn insert_str(&mut self, offset: usize, s: &str) {
         self.insert(offset, s.to_string())
@@ -207,44 +178,26 @@ impl<Ext: Sum + FromStr> StringRope<Ext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roperig_test::{test_simple_string_fuzz, FuzzOp};
     use rand::Rng;
-    use rand_chacha::rand_core::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
 
     #[test]
-    fn test_random() {
-        let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let mut expected = String::new();
+    fn test_many_ops() {
         let mut rope = StringRope::<()>::default();
-        for _ in 0..1000000 {
-            if expected.is_empty() || rng.random_bool(0.5) {
-                let from = next_char_boundary(&expected, rng.random_range(0..=expected.len()));
-                let to = next_char_boundary(&expected, rng.random_range(from..=expected.len()));
-                expected.drain(from..to);
-                rope.delete_bytes(from..to);
-            } else {
-                let offset = next_char_boundary(&expected, rng.random_range(0..=expected.len()));
-                let len = rng.random_range(0..100);
-                let s = (0..len).map(|_| {
-                    let range = if rng.random_bool(0.5) {
-                        'A'..='z'
-                    } else {
-                        '一'..='😄'
-                    };
-                    rng.random_range(range)
-                }).collect::<String>();
-                expected.insert_str(offset, &s);
-                rope.insert(offset, s);
+        test_simple_string_fuzz(move |op, expected, rng| {
+            match op {
+                FuzzOp::Insert(at, s) => rope.insert(at, s),
+                FuzzOp::Delete(r) => rope.delete_bytes(r),
             }
             let start = rng.random_range(0..=expected.len());
             let end = rng.random_range(start..=expected.len());
-            let start = next_char_boundary(&expected, start);
+            let start = next_char_boundary(expected, start);
             let start_chars = expected[..start].chars().count();
             assert_eq!(start_chars, rope.byte_to_char(start));
             assert_eq!(start, rope.char_to_byte(start_chars));
-            let end = next_char_boundary(&expected, end);
+            let end = next_char_boundary(expected, end);
             assert_eq!(&expected[start..end], rope.substring(start..end));
-        }
+        }, true);
     }
 
     fn next_char_boundary(s: &str, mut i: usize) -> usize {

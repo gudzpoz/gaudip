@@ -15,7 +15,9 @@ piece-tree = []
 rope = []
 
 [dependencies]
+delegate = { workspace = true }
 slab = { workspace = true }
+str_indices = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

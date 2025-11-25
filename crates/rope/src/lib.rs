@@ -5,11 +5,14 @@
 #![doc = include_str!("../README.md")]
 
 #![warn(missing_docs)]
+extern crate core;
 
 /// Traits for using and converting between different metric systems
 pub mod metrics;
 /// Contains traits that the user needs to implement to use ropes.
 pub mod piece;
+/// The barebone rope implementation.
+pub mod ropebase;
 /// The rope implementation.
 pub mod roperig;
 /// Utility methods for string-like rope containers

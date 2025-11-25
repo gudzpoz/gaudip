@@ -1,7 +1,25 @@
 use std::ops::Range;
-use crate::metrics::{BaseMetric, CharMetric, Metric, WithCharMetric};
-use crate::piece::{RopePiece, Sum};
+use crate::metrics::{BaseMetric, Metric};
+use crate::piece::RopePiece;
+use crate::ropebase::ConvertedPosition;
 use crate::roperig::Rope;
+
+/// Basic methods to allow automatic implementation of [CharMetric]
+pub trait WithCharMetric: RopePiece {
+    /// Returns the string of this piece
+    fn get<'a>(&'a self, ctx: &'a Self::Context) -> &'a str;
+
+    /// Returns the number of characters in the piece
+    fn chars(sum: &Self::S) -> usize;
+}
+
+/// Metric that measure char counts
+pub struct CharMetric();
+impl<T: WithCharMetric> Metric<T> for CharMetric {
+    fn measure(sum: &T::S) -> usize {
+        T::chars(sum)
+    }
+}
 
 /// A utility trait for types that contain a rope
 ///
@@ -15,7 +33,7 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 
     /// Returns the length of the tree, in bytes
     fn len(&self) -> usize {
-        self.rope().len()
+        self.rope().base_len()
     }
 
     /// Returns true if the tree is empty
@@ -25,7 +43,7 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 
     /// Returns the length of the tree, in characters
     fn char_len(&self) -> usize {
-        self.rope().measure::<CharMetric>()
+        self.rope().len::<CharMetric>()
     }
 
     /// Returns a substring of the rope
@@ -37,8 +55,10 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 
     /// Appends the substring of the rope into `buffer`
     fn substring_store(&self, range: Range<usize>, buffer: &mut String) {
-        self.rope().for_range::<BaseMetric>(range, |ctx, s, range, abs| {
-            s.substring(ctx, range.start.len()..range.end.len(), abs, |sub, _| buffer.push_str(sub));
+        let rope = self.rope();
+        let Some(c) = rope.cursor_at(range.start) else { return };
+        c.for_range(&rope.tree, range.len(), |s, r| {
+            buffer.push_str(&s.get(&rope.context)[r]);
             true
         });
     }
@@ -62,14 +82,20 @@ pub trait RopeContainer<T: RopePiece + WithCharMetric> {
 impl<T: RopePiece + WithCharMetric> Rope<T> {
     /// Converts a char offset to a byte offset
     pub fn char_to_byte(&self, offset: usize) -> usize {
-        self.cursor::<CharMetric>(offset)
-            .map(|c| <BaseMetric as Metric<T>>::measure(&c.abs_offset()))
-            .unwrap_or(self.len())
+        let ConvertedPosition {
+            piece, piece_position, offset_in_piece,
+        } = self.tree.convert_metrics::<CharMetric, BaseMetric>(offset);
+        let Some(piece) = piece else { return if offset == 0 { 0 } else { self.tree.len::<BaseMetric>() } };
+        let s = piece.get(&self.context);
+        str_indices::chars::to_byte_idx(s, offset_in_piece.value) + piece_position.value
     }
     /// Converts a byte offset to a char offset
     pub fn byte_to_char(&self, offset: usize) -> usize {
-        self.cursor::<BaseMetric>(offset)
-            .map(|c| <CharMetric as Metric<T>>::measure(&c.abs_offset()))
-            .unwrap_or(self.len())
+        let ConvertedPosition {
+            piece, piece_position, offset_in_piece,
+        } = self.tree.convert_metrics::<BaseMetric, CharMetric>(offset);
+        let Some(piece) = piece else { return if offset == 0 { 0 } else { self.tree.len::<CharMetric>() } };
+        let s = piece.get(&self.context);
+        str_indices::chars::from_byte_idx(s, offset_in_piece.value) + piece_position.value
     }
 }
