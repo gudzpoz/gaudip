@@ -18,11 +18,14 @@ pub mod imp {
     use super::*;
     use crate::data::buffer::LineBuffer;
     use crate::data::virtlines::{LineInfo, VirtualLines};
+    use crate::events::tokio_runtime;
     use crate::utils::pango_utils::{PangoUnit, PixelUnit};
     use glib;
     use glib::clone;
-    use gtk::gdk::RGBA;
-    use gtk::graphene::Point;
+    use gtk::gdk::{Cursor, RGBA};
+    use gtk::graphene::{Point, Rect};
+    use gtk::gsk::BlendMode;
+    use gtk::pango::ffi::PANGO_SCALE;
     use gtk::pango::{Layout, Rectangle, WrapMode};
     use gtk::prelude::{ObjectExt, SnapshotExt};
     use gtk::subclass::prelude::*;
@@ -44,6 +47,8 @@ pub mod imp {
         #[property(get, set, override_interface = gtk::Scrollable)]
         pub vscroll_policy: Cell<gtk::ScrollablePolicy>,
 
+        cursor: Option<Cursor>,
+
         view: RefCell<VirtualLines<LineInner>>,
         v_ratio: Cell<f64>,
     }
@@ -63,19 +68,10 @@ pub mod imp {
 
         fn new() -> Self {
             let mut buffer = VirtualLines::default();
-            for i in 0..100 {
-                let mut text = LineBuffer::default();
-                // TODO: this is test texts (emoji, large glyphs, grapheme clusters, etc.)
-                text.insert(0, format!("Text Line 🥝 𒐫 a⃰⃰⃰⃰⃰⃰⃰ {}", i).as_str().into());
-                let text = LineInner {
-                    text, rendered: Default::default(), rendered_width: Default::default(),
-                };
-                buffer.insert_line(NonZero::new(i + 1).unwrap(), LineInfo {
-                    chars: text.text.chars() + 1, // +LF
-                    lines: 1,
-                    height: PangoUnit::from(PixelUnit(2000)).0 as usize,
-                }, Some(text));
-            }
+            buffer.init_lines(&mut (0..10_000_000).map(|_| (LineInfo {
+                chars: 1, lines: 1,
+                height: PangoUnit::from(PixelUnit(20)).0 as usize,
+            }, None)));
             Self {
                 vadjustment: Default::default(),
                 vadjustment_signal: Default::default(),
@@ -83,6 +79,7 @@ pub mod imp {
                 hadjustment_signal: Default::default(),
                 hscroll_policy: Cell::new(gtk::ScrollablePolicy::Natural),
                 vscroll_policy: Cell::new(gtk::ScrollablePolicy::Natural),
+                cursor: Cursor::from_name("text", None),
                 view: buffer.into(),
                 v_ratio: Default::default(),
             }
@@ -112,64 +109,7 @@ pub mod imp {
             self.obj().queue_draw();
         }
         fn snapshot(&self, snapshot: &Snapshot) {
-            let obj = self.obj();
-            let width = PangoUnit::from(PixelUnit(obj.width())).0;
-            let limit = PangoUnit::from(PixelUnit(self.obj().height())).0 as isize;
-            let mut buffer = self.view.borrow_mut();
-            let mut iter = buffer.iter_from_current();
-            let mut offset = 0;
-            let mut height_updated = false;
-            while iter.has_next() && offset < limit {
-                let Some((rel_offset, line, info)) = iter.current(&buffer) else { break };
-                offset += rel_offset;
-                snapshot.translate(&Point::new(0.0, PangoUnit(rel_offset as i32).into()));
-
-                let mut height = info.height;
-                if let Some(line) = line {
-                    let mut rendered = line.rendered.borrow_mut();
-                    let layout = match rendered.as_ref() {
-                        Some(layout) => {
-                            if line.rendered_width.get() != width {
-                                layout.set_width(width);
-                                line.rendered_width.set(width);
-                            }
-                            layout
-                        }
-                        _ => {
-                            let layout = Layout::new(&obj.pango_context());
-                            layout.set_single_paragraph_mode(true);
-                            layout.set_width(width);
-                            layout.set_wrap(WrapMode::WordChar);
-                            layout.set_text(str::from_utf8(line.text.pango_bytes()).unwrap_or("\\"));
-
-                            line.rendered_width.set(width);
-                            rendered.replace(layout);
-                            rendered.as_ref().expect("just set")
-                        }
-                    };
-                    snapshot.append_layout(layout, &RGBA::BLACK);
-
-                    let actual_height = layout.extents().1.height();
-                    drop(rendered);
-
-                    if actual_height as usize != height {
-                        iter.update_line(&mut buffer, &LineInfo {
-                            chars: 0, lines: 0,
-                            height: (actual_height as usize).wrapping_sub(height),
-                        });
-                        height = actual_height as usize;
-                        height_updated = true;
-                    }
-                }
-                snapshot.translate(&Point::new(0.0, PangoUnit(height as i32).into()));
-                offset = offset.saturating_add_unsigned(height);
-                iter.advance(&buffer);
-            }
-            if height_updated {
-                // We should not call update_vscroll in snapshot,
-                // so we ask to queue a resize, where size_allocate will call update_vscroll.
-                obj.queue_resize();
-            }
+            self.try_snapshot(Some(snapshot));
         }
     }
     impl ScrollableImpl for ScrolledTextView {}
@@ -199,10 +139,11 @@ pub mod imp {
         fn update_vscroll(&self, height: usize, total: usize) {
             let adj_mut = self.vadjustment.borrow_mut();
             if let Some(adj) = &*adj_mut {
+                adj.set_step_increment(50.0);
                 adj.set_lower(0.0);
-                let page = PangoUnit::from(PixelUnit(height as i32)).0 as f64;
+                let page = height as f64;
                 adj.set_page_size(page);
-                adj.set_upper(total as f64 + page);
+                adj.set_upper((total / PANGO_SCALE as usize) as f64 + page);
             }
         }
 
@@ -218,6 +159,8 @@ pub mod imp {
             } else {
                 (next - prev) / prev
             });
+            drop(buffer);
+            self.try_snapshot(None); // pre-fetch lines to reduce flickering
             self.obj().queue_draw();
         }
 
@@ -225,10 +168,18 @@ pub mod imp {
             let y = PangoUnit::from_pixels(y).0;
             let mut buffer = self.view.borrow_mut();
             let Some((y, iter)) = buffer.line_at_rel_height(y as usize) else { return };
-            let Some(line) = iter.current_mut(&mut buffer) else { return };
+            let Some(line_opt) = iter.current_mut(&mut buffer) else { return };
+            let Some(line) = line_opt else { return };
             let mut rendered = line.rendered.borrow_mut();
             let Some(layout) = &*rendered else { return };
-            let byte_index = find_cursor_position(layout, x, y);
+            let (inside, byte_index) = find_cursor_position(layout, x, y);
+            if inside {
+                if let Some(cursor) = &self.cursor {
+                    self.obj().set_cursor(Some(cursor));
+                }
+            } else {
+                self.obj().set_cursor(None);
+            }
             let chars = line.text.byte_index_to_char(byte_index);
             line.text.insert(chars, ".".into());
             rendered.take();
@@ -240,12 +191,132 @@ pub mod imp {
             });
             self.obj().queue_draw();
         }
+
+        fn queue_fetch_task(&self, from: Option<NonZero<usize>>, to: Option<NonZero<usize>>) {
+            let from = from.map(|n| n.get()).unwrap_or(1);
+            let Some(to) = to.map(|n| n.get()) else { return };
+            if from > to {
+                return;
+            }
+
+            let obj = self.obj();
+            glib::spawn_future_local(clone!(
+                #[strong] obj,
+                async move {
+                    let lines = tokio_runtime().spawn(async move {
+                        // Simulated delay
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        (from..to).map(get_line).collect::<Vec<_>>()
+                    }).await;
+                    if let Ok(lines) = lines {
+                        obj.imp().update_lines(from..to, lines);
+                    }
+                    obj.queue_draw();
+                }
+            ));
+        }
+
+        fn update_lines(&self, mut range: std::ops::Range<usize>, lines: Vec<LineBuffer>) {
+            let mut buffer = self.view.borrow_mut();
+            let mut lines = lines.into_iter().map(|text| LineInner {
+                text, rendered: Default::default(), rendered_width: Default::default(),
+            });
+            let mut iter = buffer.iter_from_line(NonZero::new(range.start.max(1)).expect("1"));
+            while iter.has_next() && range.next().is_some() {
+                let Some(new) = lines.next() else { break };
+                let Some((_, _, info)) = iter.current(&buffer) else { break };
+                let chars = new.text.chars() + 1;
+                let prev_chars = info.chars;
+                let Some(line) = iter.current_mut(&mut buffer) else { break };
+                line.replace(new);
+                iter.update_line(&mut buffer, &LineInfo {
+                    chars: chars.wrapping_sub(prev_chars),
+                    lines: 0, height: 0,
+                });
+                iter.advance(&buffer);
+            }
+        }
+
+        fn try_snapshot(&self, snapshot: Option<&Snapshot>) {
+            let obj = self.obj();
+            let width = PangoUnit::from(PixelUnit(obj.width())).0;
+            let limit = PangoUnit::from(PixelUnit(self.obj().height())).0 as isize;
+            let mut buffer = self.view.borrow_mut();
+            let mut iter = buffer.iter_from_current();
+            let mut offset = 0;
+            let mut height_updated = false;
+            let mut fetch_needed = false;
+            while iter.has_next() && offset < limit {
+                let Some((rel_offset, line, info)) = iter.current(&buffer) else { break };
+                offset += rel_offset;
+                if let Some(s) = snapshot {
+                    s.translate(&Point::new(0.0, PangoUnit(rel_offset as i32).into()));
+                }
+
+                let mut height = info.height;
+                if let Some(line) = line {
+                    let mut rendered = line.rendered.borrow_mut();
+                    let layout = match rendered.as_ref() {
+                        Some(layout) => {
+                            if line.rendered_width.get() != width {
+                                layout.set_width(width);
+                                line.rendered_width.set(width);
+                            }
+                            layout
+                        }
+                        _ => {
+                            let layout = Layout::new(&obj.pango_context());
+                            layout.set_single_paragraph_mode(true);
+                            layout.set_width(width);
+                            layout.set_wrap(WrapMode::WordChar);
+                            layout.set_text(str::from_utf8(line.text.pango_bytes()).unwrap_or("\\"));
+
+                            line.rendered_width.set(width);
+                            rendered.replace(layout);
+                            rendered.as_ref().expect("just set")
+                        }
+                    };
+                    if let Some(s) = snapshot {
+                        s.append_layout(layout, &RGBA::BLACK);
+                    }
+
+                    let actual_height = layout.extents().1.height();
+                    drop(rendered);
+
+                    if actual_height as usize != height {
+                        iter.update_line(&mut buffer, &LineInfo {
+                            chars: 0, lines: 0,
+                            height: (actual_height as usize).wrapping_sub(height),
+                        });
+                        height = actual_height as usize;
+                        height_updated = true;
+                    }
+                } else {
+                    fetch_needed = true;
+                }
+                if let Some(s) = snapshot {
+                    s.translate(&Point::new(0.0, PangoUnit(height as i32).into()));
+                }
+                offset = offset.saturating_add_unsigned(height);
+                iter.advance(&buffer);
+            }
+            if fetch_needed {
+                let to = iter.current_line_num(&buffer);
+                let from = buffer.current_line_num();
+                self.queue_fetch_task(from, to);
+            }
+            if height_updated && snapshot.is_some() {
+                // We should not call update_vscroll in snapshot,
+                // so we ask to queue a resize, where size_allocate will call update_vscroll.
+                obj.queue_resize();
+            }
+        }
     }
 
-    fn find_cursor_position(layout: &Layout, x_px: f64, y: usize) -> usize {
+    fn find_cursor_position(layout: &Layout, x_px: f64, y: usize) -> (bool, usize) {
         let x = PangoUnit::from_pixels(x_px).0;
         let y = y as i32;
-        let (_inside, byte_index, remaining) = layout.xy_to_index(x, y);
+        let (inside, byte_index, remaining) = layout.xy_to_index(x, y);
         let text = layout.text();
         let s = text.as_str();
         let (before_glyph, _) = layout.cursor_pos(byte_index);
@@ -268,10 +339,17 @@ pub mod imp {
             let rh = rect.height();
             dist2p(PangoUnit(rx + rw / 2).into(), PangoUnit(ry + rh / 2).into())
         };
-        if dist2(&before_glyph) < dist2(&after_glyph) {
+        (inside, if dist2(&before_glyph) < dist2(&after_glyph) {
             byte_index as usize
         } else {
             next_index as usize
-        }
+        })
+    }
+
+    fn get_line(i: usize) -> LineBuffer {
+        let mut text = LineBuffer::default();
+        // TODO: this is test texts (emoji, large glyphs, grapheme clusters, etc.)
+        text.insert(0, format!("Text Line إلا بسم الله 🥝 𒐫  a⃰⃰⃰⃰⃰⃰⃰ {}", i).as_str().into());
+        text
     }
 }

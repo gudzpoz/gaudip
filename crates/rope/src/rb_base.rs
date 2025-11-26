@@ -230,6 +230,7 @@ impl<T: Summable> RbSlab<T> {
         // self.compact();
         let size = nodes.len();
         let red_level = (usize::BITS - 1 - (size + 1).leading_zeros()) as usize;
+        self.slab.reserve(size);
         build_from_sorted_rec(self, red_level, nodes, 0, 0, size - 1)
     }
 }

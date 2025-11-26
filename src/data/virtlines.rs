@@ -88,10 +88,16 @@ impl<T> LineIter<T> {
         let line = current.get(&lines.rope);
         Some((start, line.line.as_ref(), &line.info))
     }
-    pub fn current_mut<'a>(&self, lines: &'a mut VirtualLines<T>) -> Option<&'a mut T> {
+    pub fn current_line_num(&self, lines: &VirtualLines<T>) -> Option<LineNumber> {
+        let Some(current) = self.current.as_ref() else {
+            return LineNumber::new(lines.rope.len::<LineMetric>() + 1);
+        };
+        LineNumber::new(current.with_offset::<LineMetric>(0).position(&lines.rope) + 1)
+    }
+    pub fn current_mut<'a>(&self, lines: &'a mut VirtualLines<T>) -> Option<&'a mut Option<T>> {
         let current = self.current.as_ref()?;
         let line = current.get_mut(&mut lines.rope);
-        line.line.as_mut()
+        Some(&mut line.line)
     }
     pub fn update_line(&self, lines: &mut VirtualLines<T>, delta: &LineInfo) {
         let Some(current) = self.current.as_ref() else { return };
@@ -108,14 +114,23 @@ impl<T> VirtualLines<T> {
     pub fn height(&self) -> usize {
         self.rope.len::<HeightMetric>()
     }
+    /// Returns the current height
+    pub fn current_height(&self) -> usize {
+        self.current.as_ref().map_or(0, |c| c.position(&self.rope))
+    }
     /// Get the current line number, if any
     pub fn current_line_num(&self) -> Option<LineNumber> {
         let current = self.current.as_ref()?;
-        LineNumber::new(current.position(&self.rope) + 1)
+        LineNumber::new(current.with_offset::<LineMetric>(1).position(&self.rope))
     }
     /// Returns an iterator starting from the current line
     pub fn iter_from_current(&self) -> LineIter<T> {
         LineIter { current: self.current.clone() }
+    }
+    /// Returns an iterator starting from the specified line
+    pub fn iter_from_line(&self, line: LineNumber) -> LineIter<T> {
+        let cursor = self.rope.cursor_at::<LineMetric>(line.get());
+        LineIter { current: cursor.map(|c| c.with_offset(0)) }
     }
     /// Sets the current line by scrolling a percentage
     pub fn scroll(&mut self, percent: f64) {
@@ -150,10 +165,16 @@ impl<T> VirtualLines<T> {
         let cursor = current.navigate(&self.rope, height as isize)?;
         Some((cursor.offset().value, LineIter { current: Some(cursor) }))
     }
+    /// Batch initializes the lines
+    pub fn init_lines<I>(&mut self, lines: &mut I)
+    where I: ExactSizeIterator<Item = (LineInfo, Option<T>)> {
+        self.rope.init(lines.map(|(info, line)| OpaqueLine { line, info }));
+        self.current = self.rope.cursor_at::<HeightMetric>(0);
+    }
     /// Inserts a new line
     pub fn insert_line(&mut self, at: LineNumber, info: LineInfo, extra: Option<T>) {
         let line = OpaqueLine { line: extra, info };
-        let Some(cursor) = self.rope.cursor_at::<LineMetric>(at.get() - 1) else {
+        let Some(cursor) = self.rope.cursor_at::<LineMetric>(at.get()) else {
             self.rope.init(Some(line).into_iter());
             self.current = self.rope.cursor_at::<HeightMetric>(0);
             return;
