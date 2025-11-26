@@ -28,7 +28,7 @@ pub enum EStrSegment {
 }
 impl From<&str> for EStrSegment {
     fn from(value: &str) -> Self {
-        Self::from_counted_utf8(value.to_string(), value.len())
+        Self::from_counted_utf8(value.to_string(), value.chars().count())
     }
 }
 
@@ -164,7 +164,7 @@ impl EStrSegment {
     }
 
     pub fn write(&self, bytes: &mut [u8]) {
-        debug_assert!(bytes.len() == self.len());
+        debug_assert!(bytes.len() == self.pango_bytes());
         match self {
             Unicode { str, .. } => bytes.copy_from_slice(str.as_bytes()),
             Ascii { str } => bytes.copy_from_slice(str.as_bytes()),

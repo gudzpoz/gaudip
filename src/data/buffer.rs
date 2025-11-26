@@ -99,20 +99,20 @@ impl LineBuffer {
         let (offset, cursor) = self.char_index_to_byte(char_index);
         let Some(cursor) = cursor else {
             if self.metrics.is_empty() && char_index == 0 {
-                let extra = s.len();
+                let extra = s.pango_bytes();
                 self.expand_str(offset, extra);
                 s.write(&mut self.pango_str[offset..offset + extra]);
                 self.metrics.init(Some(s).into_iter());
             }
             return;
         };
-        let extra = s.len();
+        let extra = s.pango_bytes();
         self.expand_str(offset, extra);
         s.write(&mut self.pango_str[offset..offset + extra]);
 
         if cursor.offset().value == 0 {
             cursor.insert_left(&mut self.metrics, s);
-        } else if cursor.offset().value == cursor.get(&self.metrics).len() {
+        } else if cursor.offset().value == cursor.get(&self.metrics).pango_bytes() {
             cursor.insert_right(&mut self.metrics, s);
         } else {
             let piece = cursor.get_mut(&mut self.metrics);
