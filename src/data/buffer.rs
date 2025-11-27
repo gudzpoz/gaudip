@@ -64,13 +64,13 @@ impl LineBuffer {
         self.pango_str.drain(start_bytes..end_bytes);
         if from.is_same_piece(&to) {
             let piece = from.get_mut(&mut self.metrics);
-            let mut sum = piece.summarize().negate();
+            let piece_prev = piece.summarize();
             let tail = piece.split(to.offset().value);
             if from.offset().value != 0 {
                 piece.split(from.offset().value);
             }
-            sum.add_assign(&piece.summarize());
-            from.update(&mut self.metrics, &sum);
+            let delta = piece.summarize().sub(piece_prev);
+            from.update(&mut self.metrics, &delta);
             if !tail.is_empty() {
                 from.insert_right(&mut self.metrics, tail);
             }

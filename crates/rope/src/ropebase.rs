@@ -224,6 +224,18 @@ impl<T: Summable, M: Metric<T>> PartialCursorPos<T, M> {
     pub fn offset(&self) -> Measured<T, M> {
         self.offset_in_piece
     }
+    /// Returns the absolute position of the starting position of the current node
+    pub fn node_start(&self, tree: &RopeBase<T>) -> T::S {
+        let mut sum = tree.tree[self.node].left_sum;
+        let x = self.node;
+        let _: Option<()> = foreach_parent!(({ p: pn } of { x: xn } in tree.tree) {
+            if pn.rb.children[RIGHT] == Some(x) {
+                sum.add_assign(&pn.left_sum);
+                sum.add_assign(&pn.piece.summarize());
+            }
+        });
+        sum
+    }
 
     /// Returns a new cursor with a different offset into the same node, in metric `N`
     pub fn with_offset<N: Metric<T>>(&self, offset_in_piece: usize) -> PartialCursorPos<T, N> {

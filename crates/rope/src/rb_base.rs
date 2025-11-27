@@ -492,8 +492,7 @@ impl<T: Summable> RbSlab<T> {
             let xpn = &self[xp];
             let new_sum = self.calculate_sum(x);
             if new_sum != xpn.left_sum {
-                let mut delta = new_sum;
-                delta.sub_assign(&xpn.left_sum);
+                let delta = new_sum.sub(xpn.left_sum);
                 self[xp].left_sum = new_sum;
                 self.update_metadata(xp, &delta);
             }
@@ -604,8 +603,7 @@ impl<T: Summable> RbSlab<T> {
         }) else { return };
 
         let xn = &self[x];
-        let mut delta = self.calculate_sum(xn.rb.children[0]);
-        delta.sub_assign(&xn.left_sum);
+        let delta = self.calculate_sum(xn.rb.children[0]).sub(xn.left_sum);
 
         if delta != T::S::identity() {
             self[x].left_sum.add_assign(&delta);
@@ -670,10 +668,9 @@ impl<T: Summable> RbSlab<T> {
                 this[dest].left_sum = joined.1;
                 this.calculate_sum(Some(dest))
             } else {
-                let mut sum = joined.1;
-                sum.add_assign(&this[dest].left_sum);
-                sum.add_assign(&this[dest].piece.summarize());
-                sum
+                joined.1
+                    .add(this[dest].left_sum)
+                    .add(this[dest].piece.summarize())
             };
 
             // if (TL.color=black) and (T'.right.color=T'.right.right.color=red):
@@ -909,9 +906,9 @@ impl<T: Summable> RbSlab<T> {
             let left = verify_sums(rb, node.rb.children[0]);
             let right = verify_sums(rb, node.rb.children[1]);
             assert!(node.left_sum == left.0);
-            let mut sum = node.piece.summarize();
-            sum.add_assign(&left.0);
-            sum.add_assign(&right.0);
+            let sum = node.piece.summarize()
+                .add(left.0)
+                .add(right.0);
             (sum, 1 + left.1 + right.1)
         }
 

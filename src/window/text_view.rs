@@ -25,13 +25,15 @@ pub mod imp {
     use gtk::gdk::{Cursor, RGBA};
     use gtk::graphene::{Point, Rect};
     use gtk::gsk::BlendMode;
-    use gtk::pango::ffi::PANGO_SCALE;
     use gtk::pango::{Layout, Rectangle, WrapMode};
     use gtk::prelude::{ObjectExt, SnapshotExt};
     use gtk::subclass::prelude::*;
     use gtk::{EventControllerMotion, Snapshot};
+    use tokio::sync::Mutex;
     use std::cell::{Cell, RefCell};
     use std::num::NonZero;
+    use std::ops::Range;
+    use std::sync::Arc;
 
     #[derive(glib::Properties)]
     #[properties(wrapper_type = super::ScrolledTextView)]
@@ -49,9 +51,16 @@ pub mod imp {
 
         cursor: Option<Cursor>,
 
+        remote: Arc<Mutex<MockRpcClient>>,
+        change_version: Cell<usize>,
+        visit_line: Cell<Option<usize>>,
+
         view: RefCell<VirtualLines<LineInner>>,
         v_ratio: Cell<f64>,
     }
+
+    const MAX_FETCH_LINES: usize = 512;
+    const FETCH_LINE_LOOKAHEAD: usize = 128;
 
     struct LineInner {
         text: LineBuffer,
@@ -68,10 +77,8 @@ pub mod imp {
 
         fn new() -> Self {
             let mut buffer = VirtualLines::default();
-            buffer.init_lines(&mut (0..10_000_000).map(|_| (LineInfo {
-                chars: 1, lines: 1,
-                height: PangoUnit::from(PixelUnit(20)).0 as usize,
-            }, None)));
+            let mock = MockRpcClient();
+            buffer.init_lines(&mut Some((mock.summary(), None)).into_iter());
             Self {
                 vadjustment: Default::default(),
                 vadjustment_signal: Default::default(),
@@ -80,6 +87,9 @@ pub mod imp {
                 hscroll_policy: Cell::new(gtk::ScrollablePolicy::Natural),
                 vscroll_policy: Cell::new(gtk::ScrollablePolicy::Natural),
                 cursor: Cursor::from_name("text", None),
+                remote: Arc::new(Mutex::new(mock)),
+                change_version: Default::default(),
+                visit_line: Default::default(),
                 view: buffer.into(),
                 v_ratio: Default::default(),
             }
@@ -105,7 +115,7 @@ pub mod imp {
     impl WidgetImpl for ScrolledTextView {
         fn size_allocate(&self, _width: i32, height: i32, _baseline: i32) {
             let buffer = self.view.borrow();
-            self.update_vscroll(height as usize, buffer.height());
+            self.update_vscroll(&buffer, height as usize);
             self.obj().queue_draw();
         }
         fn snapshot(&self, snapshot: &Snapshot) {
@@ -136,21 +146,22 @@ pub mod imp {
         define_adjustment_setter!(set_vadjustment, vadjustment, vadjustment_signal);
         define_adjustment_setter!(set_hadjustment, hadjustment, hadjustment_signal);
 
-        fn update_vscroll(&self, height: usize, total: usize) {
+        fn update_vscroll(&self, buffer: &VirtualLines<LineInner>, height: usize) {
             let adj_mut = self.vadjustment.borrow_mut();
             if let Some(adj) = &*adj_mut {
+                let total = buffer.height() as f64;
                 adj.set_step_increment(50.0);
                 adj.set_lower(0.0);
                 let page = height as f64;
                 adj.set_page_size(page);
-                adj.set_upper((total / PANGO_SCALE as usize) as f64 + page);
+                adj.set_upper(total);
             }
         }
 
         fn on_adjusted(&self) {
             let prev = self.v_ratio.get();
             let next = self.vadjustment.borrow().as_ref()
-                .map(|adj| adj.value() / adj.upper())
+                .map(|adj| adj.value() / (adj.upper() - adj.page_size()))
                 .unwrap_or(0.0);
             self.v_ratio.set(next);
             let mut buffer = self.view.borrow_mut();
@@ -165,7 +176,6 @@ pub mod imp {
         }
 
         fn on_hover(&self, x: f64, y: f64) {
-            let y = PangoUnit::from_pixels(y).0;
             let mut buffer = self.view.borrow_mut();
             let Some((y, iter)) = buffer.line_at_rel_height(y as usize) else { return };
             let Some(line_opt) = iter.current_mut(&mut buffer) else { return };
@@ -185,16 +195,17 @@ pub mod imp {
             rendered.take();
             drop(rendered);
             iter.update_line(&mut buffer, &LineInfo {
-                chars: 1,
+                chars: 0, // TODO: call MockRpcClient to update server
                 lines: 0,
                 height: 0,
             });
+            self.change_version.set(self.change_version.get() + 1);
             self.obj().queue_draw();
         }
 
-        fn queue_fetch_task(&self, from: Option<NonZero<usize>>, to: Option<NonZero<usize>>) {
-            let from = from.map(|n| n.get()).unwrap_or(1);
-            let Some(to) = to.map(|n| n.get()) else { return };
+        fn queue_fetch_task(&self, from: NonZero<usize>, to: NonZero<usize>) {
+            let from = from.get();
+            let to = to.get();
             if from > to {
                 return;
             }
@@ -203,54 +214,90 @@ pub mod imp {
             glib::spawn_future_local(clone!(
                 #[strong] obj,
                 async move {
+                    let imp = obj.imp();
+                    let version = imp.change_version.get();
+                    let remote = imp.remote.clone();
                     let lines = tokio_runtime().spawn(async move {
                         // Simulated delay
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        (from..to).map(get_line).collect::<Vec<_>>()
+                        let r = remote.lock().await;
+                        let to = to.min(from + MAX_FETCH_LINES);
+                        r.get_lines(from..to)
                     }).await;
                     if let Ok(lines) = lines {
-                        obj.imp().update_lines(from..to, lines);
+                        let imp = obj.imp();
+                        if version == imp.change_version.get() {
+                            imp.update_lines(lines);
+                            imp.change_version.set(version + 1);
+                            obj.queue_resize();
+                        } else {
+                            obj.imp().queue_fetch_task(NonZero::new(from).unwrap(), NonZero::new(to).unwrap());
+                        }
                     }
-                    obj.queue_draw();
                 }
             ));
         }
 
-        fn update_lines(&self, mut range: std::ops::Range<usize>, lines: Vec<LineBuffer>) {
+        fn update_lines(&self, lines: Vec<LineResult>) {
             let mut buffer = self.view.borrow_mut();
-            let mut lines = lines.into_iter().map(|text| LineInner {
-                text, rendered: Default::default(), rendered_width: Default::default(),
-            });
-            let mut iter = buffer.iter_from_line(NonZero::new(range.start.max(1)).expect("1"));
-            while iter.has_next() && range.next().is_some() {
-                let Some(new) = lines.next() else { break };
-                let Some((_, _, info)) = iter.current(&buffer) else { break };
-                let chars = new.text.chars() + 1;
-                let prev_chars = info.chars;
-                let Some(line) = iter.current_mut(&mut buffer) else { break };
-                line.replace(new);
-                iter.update_line(&mut buffer, &LineInfo {
-                    chars: chars.wrapping_sub(prev_chars),
-                    lines: 0, height: 0,
-                });
-                iter.advance(&buffer);
+            let height = buffer.current_height();
+            let mut visited = false;
+            let visit_line = self.visit_line.get();
+            for LineResult { start_char, line_num, line } in lines {
+                visited = visited || visit_line == Some(line_num);
+                let Some(line_num) = NonZero::new(line_num) else { continue };
+                let iter = buffer.iter_from_line(line_num);
+                if !iter.has_current() {
+                    continue;
+                }
+                if let Some(Some(_)) = iter.current_mut(&mut buffer) {
+                    continue;
+                }
+                let total_height = buffer.height();
+                let total_lines = buffer.line_count();
+                let prev_lines = line_num.get() - 1;
+                let chars = line.chars() + 1; // "+1" for newline
+                iter.materialize(
+                    &mut buffer,
+                    LineInner {
+                        text: line,
+                        rendered: Default::default(), rendered_width: Default::default(),
+                    },
+                    &LineInfo {
+                        chars: start_char,
+                        lines: prev_lines,
+                        height: total_height.checked_div(total_lines).unwrap_or(0) * prev_lines,
+                    },
+                    LineInfo { chars, lines: 1, height: 20 },
+                );
+            }
+            if visited {
+                if let Some(line) = visit_line {
+                    if let Some(line) = NonZero::new(line) {
+                        buffer.scroll_to_line(line);
+                    }
+                }
+            } else {
+                buffer.scroll_to(height);
             }
         }
 
         fn try_snapshot(&self, snapshot: Option<&Snapshot>) {
             let obj = self.obj();
             let width = PangoUnit::from(PixelUnit(obj.width())).0;
-            let limit = PangoUnit::from(PixelUnit(self.obj().height())).0 as isize;
+            let limit = self.obj().height() as isize;
             let mut buffer = self.view.borrow_mut();
             let mut iter = buffer.iter_from_current();
             let mut offset = 0;
             let mut height_updated = false;
-            let mut fetch_needed = false;
-            while iter.has_next() && offset < limit {
+            let mut fetch_needed_is_first = true;
+            let mut fetch_needed_visit = None;
+            let mut fetch_needed = None;
+            while iter.has_current() && offset < limit {
                 let Some((rel_offset, line, info)) = iter.current(&buffer) else { break };
                 offset += rel_offset;
                 if let Some(s) = snapshot {
-                    s.translate(&Point::new(0.0, PangoUnit(rel_offset as i32).into()));
+                    s.translate(&Point::new(0.0, rel_offset as f32));
                 }
 
                 let mut height = info.height;
@@ -280,7 +327,7 @@ pub mod imp {
                         s.append_layout(layout, &RGBA::BLACK);
                     }
 
-                    let actual_height = layout.extents().1.height();
+                    let actual_height = PangoUnit(layout.extents().1.height()).pixels();
                     drop(rendered);
 
                     if actual_height as usize != height {
@@ -291,19 +338,28 @@ pub mod imp {
                         height = actual_height as usize;
                         height_updated = true;
                     }
-                } else {
-                    fetch_needed = true;
+                } else if fetch_needed.is_none() {
+                    let start_line = iter.current_line_num(&buffer);
+                    let line_offset_est = (info.lines * rel_offset.unsigned_abs()).checked_div(info.height).unwrap_or(0);
+                    fetch_needed = start_line.and_then(
+                        |l| NonZero::new(l.get() + line_offset_est.saturating_sub(FETCH_LINE_LOOKAHEAD)),
+                    );
+                    if fetch_needed_is_first {
+                        fetch_needed_visit = start_line;
+                    }
                 }
                 if let Some(s) = snapshot {
-                    s.translate(&Point::new(0.0, PangoUnit(height as i32).into()));
+                    s.translate(&Point::new(0.0, height as f32));
                 }
                 offset = offset.saturating_add_unsigned(height);
                 iter.advance(&buffer);
+                fetch_needed_is_first = false;
             }
-            if fetch_needed {
-                let to = iter.current_line_num(&buffer);
-                let from = buffer.current_line_num();
-                self.queue_fetch_task(from, to);
+            if let Some(from) = fetch_needed {
+                if let Some(to) = iter.current_line_num(&buffer) {
+                    self.visit_line.replace(fetch_needed_visit.map(|i| i.get()));
+                    self.queue_fetch_task(from, to);
+                }
             }
             if height_updated && snapshot.is_some() {
                 // We should not call update_vscroll in snapshot,
@@ -315,7 +371,7 @@ pub mod imp {
 
     fn find_cursor_position(layout: &Layout, x_px: f64, y: usize) -> (bool, usize) {
         let x = PangoUnit::from_pixels(x_px).0;
-        let y = y as i32;
+        let y = PangoUnit::from_pixels(y as f64).0;
         let (inside, byte_index, remaining) = layout.xy_to_index(x, y);
         let text = layout.text();
         let s = text.as_str();
@@ -346,10 +402,35 @@ pub mod imp {
         })
     }
 
-    fn get_line(i: usize) -> LineBuffer {
-        let mut text = LineBuffer::default();
-        // TODO: this is test texts (emoji, large glyphs, grapheme clusters, etc.)
-        text.insert(0, format!("Text Line إلا بسم الله 🥝 𒐫  a⃰⃰⃰⃰⃰⃰⃰ {}", i).as_str().into());
-        text
+    struct LineResult {
+        start_char: usize,
+        line_num: usize,
+        line: LineBuffer,
+    }
+    struct MockRpcClient();
+    const TEST_STR: &str = "Text Line إلا بسم الله 🥝 𒐫  a⃰⃰⃰⃰⃰⃰⃰ ";
+    impl MockRpcClient {
+        fn summary(&self) -> LineInfo {
+            let lines = 10_000_000;
+            LineInfo {
+                lines,
+                chars: (TEST_STR.chars().count() + 10 + 1) * lines,
+                height: 20 * lines,
+            }
+        }
+        fn gen_line(&self, i: usize) -> LineBuffer {
+            let mut text = LineBuffer::default();
+            // TODO: this is test texts (emoji, large glyphs, grapheme clusters, etc.)
+            text.insert(0, format!("{}{:010}", TEST_STR, i).as_str().into());
+            text
+        }
+        fn get_lines(&self, lines: Range<usize>) -> Vec<LineResult> {
+            lines.map(|i| LineResult {
+                start_char: (TEST_STR.chars().count() + 10 + 1) * (i - 1),
+                line_num: i,
+                line: self.gen_line(i),
+            }).collect()
+        }
     }
 }
+

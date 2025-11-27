@@ -34,6 +34,7 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
     ///
     /// [identity element]: https://en.wikipedia.org/wiki/Identity_element
     fn identity() -> Self;
+
     /// Returns the [inverse element] of the current sum
     ///
     /// [inverse element]: https://en.wikipedia.org/wiki/Inverse_element
@@ -41,6 +42,18 @@ pub trait Sum: Sized + Eq + PartialEq + Copy + Clone {
         let mut zero = Self::identity();
         zero.sub_assign(self);
         zero
+    }
+    /// Adds two sums
+    fn add(self, other: Self) -> Self {
+        let mut sum = self;
+        sum.add_assign(&other);
+        sum
+    }
+    /// Subtracts two sums
+    fn sub(self, other: Self) -> Self {
+        let mut sum = self;
+        sum.sub_assign(&other);
+        sum
     }
 }
 

@@ -281,8 +281,7 @@ impl GapBuffer {
             pos_start
         } else {
             self.gap_start_cursor = Some(pos_start.clone());
-            let mut delta = pos_start.head();
-            delta.sub_assign(pos_start.base.get(&self.rope));
+            let delta = pos_start.head().sub(*pos_start.base.get(&self.rope));
             pos_start.base.get_mut(&mut self.rope).add_assign(&delta);
             pos_start.base.update(&mut self.rope, &delta);
             pos_start.next(&self.rope).expect("start < end")
@@ -384,10 +383,8 @@ fn split_at(rope: &mut RopeBase<Segment>, cursor: &Cursor) -> (usize, Option<Cur
     if piece.chars == cursor.char_offset {
         return (RIGHT, cursor.base.next_piece(rope).map(|next| Cursor { base: next, char_offset: 0 }));
     }
-    let total = piece.summarize();
     let head = cursor.head();
-    let mut tail = total;
-    tail.sub_assign(&head);
+    let tail = piece.summarize().sub(head);
     *cursor.base.get_mut(rope) = head;
     cursor.base.update(rope, &tail.negate());
     let next = cursor.base.insert_right(rope, tail);
