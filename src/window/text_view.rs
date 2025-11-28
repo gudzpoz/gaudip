@@ -10,6 +10,7 @@ impl ScrolledTextView {
         let new: Self = glib::Object::builder().build();
         new.set_hexpand(true);
         new.set_vexpand(true);
+        new.set_focusable(true);
         new
     }
 }
@@ -22,13 +23,13 @@ pub mod imp {
     use crate::utils::pango_utils::{PangoUnit, PixelUnit};
     use glib;
     use glib::clone;
-    use gtk::gdk::{Cursor, RGBA};
+    use gtk::gdk::{Cursor, Key, ModifierType, RGBA};
     use gtk::graphene::{Point, Rect};
     use gtk::gsk::BlendMode;
     use gtk::pango::{Layout, Rectangle, WrapMode};
     use gtk::prelude::{ObjectExt, SnapshotExt};
     use gtk::subclass::prelude::*;
-    use gtk::{EventControllerMotion, Snapshot};
+    use gtk::{EventControllerKey, EventControllerMotion, Snapshot};
     use tokio::sync::Mutex;
     use std::cell::{Cell, RefCell};
     use std::num::NonZero;
@@ -64,6 +65,7 @@ pub mod imp {
 
     struct LineInner {
         text: LineBuffer,
+        cursor_offset: Option<usize>,
         rendered: RefCell<Option<Layout>>,
         rendered_width: Cell<i32>,
     }
@@ -77,7 +79,7 @@ pub mod imp {
 
         fn new() -> Self {
             let mut buffer = VirtualLines::default();
-            let mock = MockRpcClient();
+            let mock = MockRpcClient::default();
             buffer.init_lines(&mut Some((mock.summary(), None)).into_iter());
             Self {
                 vadjustment: Default::default(),
@@ -102,14 +104,25 @@ pub mod imp {
             self.parent_constructed();
 
             let motion = EventControllerMotion::new();
-            let this = self;
+            let obj = self.obj();
             motion.connect_motion(clone!(
-                #[weak] this,
+                #[strong] obj,
                 move |_, x, y| {
-                    this.on_hover(x, y);
+                    obj.imp().on_hover(x, y);
                 }
             ));
             self.obj().add_controller(motion);
+
+            let keys = EventControllerKey::new();
+            let obj = self.obj();
+            keys.connect_key_pressed(clone!(
+                #[strong] obj,
+                move |_, key, keycode, state| {
+                    obj.imp().on_key(key, keycode, state);
+                    glib::Propagation::Stop
+                }
+            ));
+            self.obj().add_controller(keys);
         }
     }
     impl WidgetImpl for ScrolledTextView {
@@ -119,7 +132,16 @@ pub mod imp {
             self.obj().queue_draw();
         }
         fn snapshot(&self, snapshot: &Snapshot) {
-            self.try_snapshot(Some(snapshot));
+            snapshot.push_blend(BlendMode::Difference);
+            let caret = self.try_snapshot(Some(snapshot));
+            snapshot.pop();
+            if let Some((offset, caret)) = caret {
+                snapshot.translate(&Point::new(0.0, offset as f32));
+                snapshot.append_color(&RGBA::WHITE, &caret);
+            } else {
+                snapshot.append_color(&RGBA::WHITE, &Rect::zero());
+            }
+            snapshot.pop();
         }
     }
     impl ScrollableImpl for ScrolledTextView {}
@@ -175,6 +197,31 @@ pub mod imp {
             self.obj().queue_draw();
         }
 
+        fn on_key(&self, key: Key, _keycode: u32, _state: ModifierType) {
+            let obj = self.obj();
+            glib::spawn_future_local(clone!(
+                #[strong] obj,
+                async move {
+                    let imp = obj.imp();
+                    let rpc = imp.remote.lock().await;
+                    let mut cursor = rpc.get_cursor_pos();
+                    if key == Key::Left {
+                        cursor = cursor.saturating_sub(1);
+                        rpc.set_cursor_pos(cursor);
+                    } else if key == Key::Right {
+                        cursor += 1;
+                        rpc.set_cursor_pos(cursor);
+                    }
+                    let mut buffer = imp.view.borrow_mut();
+                    buffer.remove_cursor(|line| { line.cursor_offset.take(); });
+                    if let Some((line, cursor)) = buffer.insert_cursor(cursor) {
+                        line.cursor_offset.replace(cursor);
+                    }
+                    obj.queue_draw();
+                }
+            ));
+        }
+
         fn on_hover(&self, x: f64, y: f64) {
             let mut buffer = self.view.borrow_mut();
             let Some((y, iter)) = buffer.line_at_rel_height(y as usize) else { return };
@@ -194,11 +241,8 @@ pub mod imp {
             line.text.insert(chars, ".".into());
             rendered.take();
             drop(rendered);
-            iter.update_line(&mut buffer, &LineInfo {
-                chars: 0, // TODO: call MockRpcClient to update server
-                lines: 0,
-                height: 0,
-            });
+            // TODO: call MockRpcClient to update server
+            iter.update_line(&mut buffer, &LineInfo::default());
             self.change_version.set(self.change_version.get() + 1);
             self.obj().queue_draw();
         }
@@ -217,17 +261,17 @@ pub mod imp {
                     let imp = obj.imp();
                     let version = imp.change_version.get();
                     let remote = imp.remote.clone();
-                    let lines = tokio_runtime().spawn(async move {
+                    let res = tokio_runtime().spawn(async move {
                         // Simulated delay
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         let r = remote.lock().await;
                         let to = to.min(from + MAX_FETCH_LINES);
-                        r.get_lines(from..to)
+                        (r.get_cursor_pos(), r.get_lines(from..to))
                     }).await;
-                    if let Ok(lines) = lines {
+                    if let Ok((cursor, lines)) = res {
                         let imp = obj.imp();
                         if version == imp.change_version.get() {
-                            imp.update_lines(lines);
+                            imp.update_lines(cursor, lines);
                             imp.change_version.set(version + 1);
                             obj.queue_resize();
                         } else {
@@ -238,11 +282,14 @@ pub mod imp {
             ));
         }
 
-        fn update_lines(&self, lines: Vec<LineResult>) {
+        fn update_lines(&self, cursor: usize, lines: Vec<LineResult>) {
             let mut buffer = self.view.borrow_mut();
+            buffer.remove_cursor(|line| { line.cursor_offset.take(); });
+
             let height = buffer.current_height();
             let mut visited = false;
             let visit_line = self.visit_line.get();
+            let mut cursor_line = None;
             for LineResult { start_char, line_num, line } in lines {
                 visited = visited || visit_line == Some(line_num);
                 let Some(line_num) = NonZero::new(line_num) else { continue };
@@ -257,19 +304,28 @@ pub mod imp {
                 let total_lines = buffer.line_count();
                 let prev_lines = line_num.get() - 1;
                 let chars = line.chars() + 1; // "+1" for newline
+                if cursor >= start_char && cursor < start_char + chars {
+                    cursor_line.replace(line_num);
+                }
                 iter.materialize(
                     &mut buffer,
                     LineInner {
                         text: line,
-                        rendered: Default::default(), rendered_width: Default::default(),
+                        cursor_offset: Default::default(),
+                        rendered: Default::default(),
+                        rendered_width: Default::default(),
                     },
                     &LineInfo {
                         chars: start_char,
                         lines: prev_lines,
                         height: total_height.checked_div(total_lines).unwrap_or(0) * prev_lines,
+                        has_cursor: 0,
                     },
-                    LineInfo { chars, lines: 1, height: 20 },
+                    LineInfo { chars, lines: 1, height: 20, has_cursor: 0 },
                 );
+            }
+            if let Some((line, cursor)) = buffer.insert_cursor(cursor) {
+                line.cursor_offset.replace(cursor);
             }
             if visited {
                 if let Some(line) = visit_line {
@@ -282,7 +338,7 @@ pub mod imp {
             }
         }
 
-        fn try_snapshot(&self, snapshot: Option<&Snapshot>) {
+        fn try_snapshot(&self, snapshot: Option<&Snapshot>) -> Option<(isize, Rect)> {
             let obj = self.obj();
             let width = PangoUnit::from(PixelUnit(obj.width())).0;
             let limit = self.obj().height() as isize;
@@ -293,6 +349,7 @@ pub mod imp {
             let mut fetch_needed_is_first = true;
             let mut fetch_needed_visit = None;
             let mut fetch_needed = None;
+            let mut caret_pos = None;
             while iter.has_current() && offset < limit {
                 let Some((rel_offset, line, info)) = iter.current(&buffer) else { break };
                 offset += rel_offset;
@@ -324,6 +381,18 @@ pub mod imp {
                         }
                     };
                     if let Some(s) = snapshot {
+                        if let Some(cursor) = line.cursor_offset {
+                            let byte_offset = line.text.char_index_to_byte(cursor);
+                            let caret_pango = layout.caret_pos(byte_offset as i32).0;
+                            let caret = Rect::new(
+                                PangoUnit(caret_pango.x()).into(),
+                                PangoUnit(caret_pango.y()).into(),
+                                f32::from(PangoUnit(caret_pango.width())).max(5.0),
+                                PangoUnit(caret_pango.height()).into(),
+                            );
+                            s.append_color(&RGBA::WHITE, &caret);
+                            caret_pos = Some((offset, caret));
+                        }
                         s.append_layout(layout, &RGBA::BLACK);
                     }
 
@@ -332,7 +401,7 @@ pub mod imp {
 
                     if actual_height as usize != height {
                         iter.update_line(&mut buffer, &LineInfo {
-                            chars: 0, lines: 0,
+                            chars: 0, lines: 0, has_cursor: 0,
                             height: (actual_height as usize).wrapping_sub(height),
                         });
                         height = actual_height as usize;
@@ -366,6 +435,7 @@ pub mod imp {
                 // so we ask to queue a resize, where size_allocate will call update_vscroll.
                 obj.queue_resize();
             }
+            caret_pos
         }
     }
 
@@ -407,7 +477,10 @@ pub mod imp {
         line_num: usize,
         line: LineBuffer,
     }
-    struct MockRpcClient();
+    #[derive(Default)]
+    struct MockRpcClient {
+        cursor: Cell<usize>,
+    }
     const TEST_STR: &str = "Text Line إلا بسم الله 🥝 𒐫  a⃰⃰⃰⃰⃰⃰⃰ ";
     impl MockRpcClient {
         fn summary(&self) -> LineInfo {
@@ -416,6 +489,7 @@ pub mod imp {
                 lines,
                 chars: (TEST_STR.chars().count() + 10 + 1) * lines,
                 height: 20 * lines,
+                has_cursor: 1,
             }
         }
         fn gen_line(&self, i: usize) -> LineBuffer {
@@ -430,6 +504,12 @@ pub mod imp {
                 line_num: i,
                 line: self.gen_line(i),
             }).collect()
+        }
+        fn get_cursor_pos(&self) -> usize {
+            self.cursor.get()
+        }
+        fn set_cursor_pos(&self, pos: usize) {
+            self.cursor.set(pos);
         }
     }
 }

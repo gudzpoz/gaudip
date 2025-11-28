@@ -31,8 +31,12 @@ impl LineBuffer {
         piece.pango_offset_to_char_offset(offset_in_piece.value) + piece_position.value
     }
 
+    pub fn char_index_to_byte(&self, char_index: usize) -> usize {
+        self.char_index_to_byte_pos(char_index).0
+    }
+
     pub fn split(&mut self, char_index: usize) -> LineBuffer {
-        let (byte_offset, cursor) = self.char_index_to_byte(char_index);
+        let (byte_offset, cursor) = self.char_index_to_byte_pos(char_index);
         let tail_str = self.pango_str.split_off(byte_offset);
 
         let Some(cursor) = cursor else { return LineBuffer::default() };
@@ -58,8 +62,8 @@ impl LineBuffer {
         if chars.is_empty() {
             return;
         }
-        let (start_bytes, from) = self.char_index_to_byte(chars.start);
-        let (end_bytes, to) = self.char_index_to_byte(chars.end);
+        let (start_bytes, from) = self.char_index_to_byte_pos(chars.start);
+        let (end_bytes, to) = self.char_index_to_byte_pos(chars.end);
         let (Some(mut from), Some(to)) = (from, to) else { return };
         self.pango_str.drain(start_bytes..end_bytes);
         if from.is_same_piece(&to) {
@@ -96,7 +100,7 @@ impl LineBuffer {
     }
 
     pub fn insert(&mut self, char_index: usize, s: EStrSegment) {
-        let (offset, cursor) = self.char_index_to_byte(char_index);
+        let (offset, cursor) = self.char_index_to_byte_pos(char_index);
         let Some(cursor) = cursor else {
             if self.metrics.is_empty() && char_index == 0 {
                 let extra = s.pango_bytes();
@@ -130,7 +134,7 @@ impl LineBuffer {
         self.pango_str.copy_within(offset..end, offset + extra);
     }
 
-    fn char_index_to_byte(&self, index: usize) -> (usize, Option<PartialCursorPos<EStrSegment, BaseMetric>>) {
+    fn char_index_to_byte_pos(&self, index: usize) -> (usize, Option<PartialCursorPos<EStrSegment, BaseMetric>>) {
         let (acc, cursor) = self.metrics.accumulate::<BaseMetric, _, _>(
             index, |acc, s| acc + s.pango, 0,
         );

@@ -1,4 +1,4 @@
-use roperig::metrics::Metric;
+use roperig::metrics::{BaseMetric, Metric};
 use roperig::piece::{Sum, Summable};
 use roperig::ropebase::{PartialCursorPos, RopeBase};
 use std::num::NonZero;
@@ -15,6 +15,8 @@ pub struct LineInfo {
     /// This is a cached/estimated value. The user is responsible for updating it
     /// on resize.
     pub height: usize,
+    /// Whether this line contains a cursor
+    pub has_cursor: usize,
 }
 impl Sum for LineInfo {
     fn len(&self) -> usize {
@@ -25,12 +27,14 @@ impl Sum for LineInfo {
         self.chars = self.chars.wrapping_add(other.chars);
         self.lines = self.lines.wrapping_add(other.lines);
         self.height = self.height.wrapping_add(other.height);
+        self.has_cursor = self.has_cursor.wrapping_add(other.has_cursor);
     }
 
     fn sub_assign(&mut self, other: &Self) {
         self.chars = self.chars.wrapping_sub(other.chars);
         self.lines = self.lines.wrapping_sub(other.lines);
         self.height = self.height.wrapping_sub(other.height);
+        self.has_cursor = self.has_cursor.wrapping_sub(other.has_cursor);
     }
 
     fn identity() -> Self {
@@ -59,6 +63,12 @@ struct HeightMetric();
 impl<T> Metric<OpaqueLine<T>> for HeightMetric {
     fn measure(sum: &LineInfo) -> usize {
         sum.height
+    }
+}
+struct CursorMetric();
+impl<T> Metric<OpaqueLine<T>> for CursorMetric {
+    fn measure(sum: &LineInfo) -> usize {
+        sum.has_cursor
     }
 }
 
@@ -110,8 +120,7 @@ impl<T> LineIter<T> {
     /// Updates the stats of the current line
     pub fn update_line(&self, lines: &mut VirtualLines<T>, delta: &LineInfo) {
         let Some(current) = self.current.as_ref() else { return };
-        current.get_mut(&mut lines.rope).info.add_assign(delta);
-        current.update(&mut lines.rope, delta);
+        current.update_line_info(lines, delta);
     }
     /// Advances to the next line
     pub fn advance(&mut self, lines: &VirtualLines<T>) {
@@ -177,16 +186,12 @@ impl<T> LineIter<T> {
                 return Some(());
             }
             // head replace: (virt#1) => (mat#2)(virt#1)
-            let new_info = line.info.sub(size);
-            current.get_mut(&mut lines.rope).info = new_info;
-            current.update(&mut lines.rope, &size.negate());
+            current.update_line_info(lines, &size.negate());
             current.insert_left(&mut lines.rope, OpaqueLine { line: Some(inner), info: size });
         } else {
             // mid/tail replace: (virt#1) => (virt#1)(mat#2) or (virt#1)(mat#2)(virt#3)
             let tail = line.info.sub(offset).sub(size);
-            let delta = offset.sub(line.info);
-            current.get_mut(&mut lines.rope).info = offset;
-            current.update(&mut lines.rope, &delta);
+            current.set_line_info(lines, offset);
             let next = current.insert_right(&mut lines.rope, OpaqueLine { line: Some(inner), info: size });
             if tail.chars != 0 {
                 next.insert_right(&mut lines.rope, OpaqueLine { line: None, info: tail });
@@ -284,5 +289,45 @@ impl<T> VirtualLines<T> {
         } else {
             cursor.insert_right(&mut self.rope, line);
         }
+    }
+    /// Removes the caret cursor from buffer
+    pub fn remove_cursor<F>(&mut self, reset: F) where F: Fn(&mut T) {
+        while let Some(c) = self.rope.cursor_at::<CursorMetric>(1) {
+            c.update_line_info(self, &LineInfo {
+                chars: 0, lines: 0, height: 0,
+                has_cursor: 0usize.wrapping_sub(1),
+            });
+            if let Some(line) = c.get_mut(&mut self.rope).line.as_mut() {
+                reset(line);
+            }
+        }
+    }
+    /// Inserts the caret cursor into buffer
+    pub fn insert_cursor(&'_ mut self, chars: usize) -> Option<(&'_ mut T, usize)> {
+        if let Some(c) = self.rope.cursor_at::<BaseMetric>(chars) {
+            let offset = c.offset().value;
+            c.update_line_info(self, &LineInfo { chars: 0, lines: 0, height: 0, has_cursor: 1 });
+            c.get_mut(&mut self.rope).line.as_mut().map(|line| (line, offset))
+        } else {
+            None
+        }
+    }
+}
+
+trait UpdateLine<T> {
+    fn set_line_info(&self, lines: &mut VirtualLines<T>, value: LineInfo);
+    fn update_line_info(&self, lines: &mut VirtualLines<T>, delta: &LineInfo);
+}
+impl<T, M: Metric<OpaqueLine<T>>> UpdateLine<T> for PartialCursorPos<OpaqueLine<T>, M> {
+    fn set_line_info(&self, lines: &mut VirtualLines<T>, value: LineInfo) {
+        let line = self.get_mut(&mut lines.rope);
+        let prev = line.info;
+        line.info = value;
+        self.update(&mut lines.rope, &value.sub(prev));
+    }
+    fn update_line_info(&self, lines: &mut VirtualLines<T>, delta: &LineInfo) {
+        let line = self.get_mut(&mut lines.rope);
+        line.info.add_assign(delta);
+        self.update(&mut lines.rope, delta);
     }
 }
