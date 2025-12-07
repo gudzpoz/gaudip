@@ -1,0 +1,18 @@
+[package]
+name = "intervals-rig"
+license = "MIT"
+version = "0.1.0"
+authors = [
+    "gudzpoz <gudzpoz@live.com>",
+    "Sevag Hanssian <sevag.hanssian@gmail.com>",
+]
+edition.workspace = true
+
+[dependencies]
+bitflags = { workspace = true }
+slab = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rand_chacha = { workspace = true }

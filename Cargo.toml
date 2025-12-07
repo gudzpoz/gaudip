@@ -1,24 +1,28 @@
 [package]
 name = "gaudip"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [workspace]
 members = [
     "crates/rope",
+    "crates/intervals",
 ]
 
 [workspace.package]
 edition = "2024"
 
 [workspace.dependencies]
+bitflags = "2.10.0"
 delegate = "0.13.5"
 rand = "0.9.2"
 rand_chacha = "0.9.0"
 slab = "0.4.11"
+smallvec = "1.15.1"
 str_indices = "0.4.4"
 
 roperig = { path = "crates/rope" }
+intervals = { path = "crates/intervals" }
 
 [dependencies]
 glib = "0.21"

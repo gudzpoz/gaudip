@@ -19,7 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Copyright (c) 2015 - present Microsoft Corporation
+// Copyright (c) 2015 - 2025 Microsoft Corporation
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -413,7 +413,7 @@ impl<T: Summable> RbSlab<T> {
             self.root = y;
         } else {
             let parent = &mut self[parent];
-            let dir = if parent.children[0] == x { 0 } else { 1 };
+            let dir = if parent.children[LEFT] == x { LEFT } else { RIGHT };
             parent.children[dir] = y;
         }
     }
@@ -443,19 +443,19 @@ impl<T: Summable> RbSlab<T> {
         let yn = &self[y].rb;
         let y_red = yn.red;
         let y_parent = yn.parent;
+        let ypn = &mut self[y_parent];
 
-        let y_parent_i = if Some(y) == self[y_parent].children[0] {
-            0
+        if Some(y) == ypn.children[LEFT] {
+            ypn.children[LEFT] = x;
         } else {
-            1
-        };
-        self[y_parent].children[y_parent_i] = x;
+            ypn.children[RIGHT] = x;
+        }
 
         if y == z {
             self[x].parent = y_parent;
             self.recompute_sum(x);
         } else {
-            self[x].parent = if Some(z) == self[y].rb.parent { Some(y) } else { y_parent };
+            self[x].parent = if Some(z) == y_parent { Some(y) } else { y_parent };
             self.recompute_sum(x);
 
             let (yn, zn) = self.get2(y, z);
@@ -469,10 +469,10 @@ impl<T: Summable> RbSlab<T> {
             if Some(z) == self.root {
                 self.root = y;
             } else {
-                let parent = self[z].rb.parent;
-                let zp = &mut self[parent];
-                let dir = if Some(z) == zp.children[0] { 0 } else { 1 };
-                zp.children[dir] = y;
+                let zp = self[z].rb.parent;
+                let zpn = &mut self[zp];
+                let dir = if Some(z) == zpn.children[LEFT] { LEFT } else { RIGHT };
+                zpn.children[dir] = y;
             }
 
             if let Some(idx) = yn_children[0] {
@@ -510,7 +510,7 @@ impl<T: Summable> RbSlab<T> {
     fn rb_insert_fixup(&mut self, mut x: Ref) {
         while x != self.root && !self[x].red {
             let p = self[x].parent;
-            let dir = if x == self[p].children[0] { 1 } else { 0 };
+            let dir = if x == self[p].children[LEFT] { RIGHT } else { LEFT };
             let mut w = self[p].children[dir];
             if self[w].red {
                 self[w].red = false;
@@ -520,8 +520,7 @@ impl<T: Summable> RbSlab<T> {
                 // recompute w after the rotation of p
                 w = self[p].children[dir];
             }
-            let wl = self[w].children[0];
-            let wr = self[w].children[1];
+            let [wl, wr] = self[w].children;
             if !self[wl].red && !self[wr].red {
                 self[w].red = true;
                 x = p;
@@ -559,7 +558,7 @@ impl<T: Summable> RbSlab<T> {
             p = self[z].parent;
             let mut pp = self[p].parent;
 
-            let dir = if self[pp].children[0] == p { 1 } else { 0 };
+            let dir = if self[pp].children[LEFT] == p { RIGHT } else { LEFT };
 
             let y = self[pp].children[dir];
 
@@ -831,9 +830,6 @@ impl<T: Summable> RbSlab<T> {
 }
 
 #[cfg(test)]
-use std::collections::VecDeque;
-
-#[cfg(test)]
 /// The rb-tree implementation is actually split across two files:
 /// `rb_base.rs` and `roperig.rs`, with the majority of tests put
 /// in `roperig.rs`.
@@ -870,7 +866,8 @@ impl<T: Summable> RbSlab<T> {
             if rb.root.is_none() {
                 return true;
             }
-            let mut queue: VecDeque<Ref> = VecDeque::new();
+
+            let mut queue: std::collections::VecDeque<Ref> = Default::default();
             queue.push_front(rb.root);
 
             while !queue.is_empty() {
