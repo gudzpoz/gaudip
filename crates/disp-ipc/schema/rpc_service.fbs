@@ -1,0 +1,37 @@
+// This file contains all the IPC endpoints, specified as FlatBuffers rpc_service.
+// For rpc_service, FlatBuffers uses gRPC, which is a bit heavyweight, and it
+// does not support Rust for now. So, instead of using gRPC, we use a rather simple
+// IPC schema, and this file is for the user to generate such IPC code themselves.
+//
+// # File Format
+// To ease the burden of code-generation, this file promises that, all IPC endpoints
+// are defined by lines strictly matching the following regular expression:
+//
+//     /^  (\w+)\((\w+)\):(\w+) \(id: (\d+)\);$/
+//
+// Or, using named capture groups:
+//
+//     /^  (?<endpoint>\w+)\((?<request>\w+)\):(?<response>\w+) \(id: (?<id>\d+)\);$/
+//
+// # IPC Schema
+//
+// - `(packet_id: u32)(endpoint_id: u32)(length: u32)(_: u32)(packet_content: [u8; length])`
+//
+// - The byte-order is native.
+// - `packet_id`: Auto-incrementing packet ID, used for request tracking and synchronization.
+//   - On first connect, the client must make a registration request, with `packet_id = 0`.
+// - `endpoint_id`: As is specified by this file, non-zero.
+// - `length`: The length in bytes of `packet_content`.
+// - `_`: Reserved. We might afford a bit of CRC checking?
+// - `packet_content`: FlatBuffers-encoded content, as is specified in relevant schema files.
+//
+// The response is encoded in exactly the same format, except that its `endpoint_id` is zero.
+
+include "registration.fbs";
+include "buffer.fbs";
+
+namespace party.iroiro.juicemacs.ipc;
+
+rpc_service EditorServer {
+  Ping(PingRequest):PingResponse (id: 1);
+}

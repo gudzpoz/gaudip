@@ -1,0 +1,15 @@
+[package]
+name = "disp-ipc"
+license = "MIT"
+version = "0.1.0"
+authors = [
+    "gudzpoz <gudzpoz@live.com>",
+]
+edition.workspace = true
+
+[dependencies]
+dirs = { workspace = true }
+flatbuffers = { workspace = true }
+interprocess = { workspace = true, features = ["tokio"] }
+object-pool = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

@@ -1,0 +1,13 @@
+namespace party.iroiro.juicemacs.ipc;
+
+/// An Emacs string in special encodings
+table EmacsString {
+  /// The underlying data
+  data: [ubyte];
+  /// The length in chars and encoding info
+  ///
+  /// The length is signed:
+  /// - Positive: Encoded in `utf-8-emacs` coding.
+  /// - Negative: Encoded in `raw-text` (bytes).
+  length: long;
+}
