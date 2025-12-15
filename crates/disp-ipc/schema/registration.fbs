@@ -1,9 +1,26 @@
 namespace party.iroiro.juicemacs.ipc;
 
+enum IpcErrorType: uint32 {
+  GenericError = 0,
+  UnknownEndpoint = 1,
+}
+table IpcError {
+  type: IpcErrorType;
+  message: string;
+}
+
 table PingRequest {
   ping: string (required);
 }
-
 table PingResponse {
   pong: string (required);
+}
+
+table RegistrationRequest {
+  type: string (required);
+  display: string (required);
+}
+table RegistrationResponse {
+  title: string (required);
+  init_buffer: uint32;
 }

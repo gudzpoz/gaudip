@@ -87,20 +87,24 @@ pub async fn handle<T: IpcListener>(
     }}
 }}
 "#,
-            endpoints.iter().filter(|e| e.ty != Type::Client2Server)
+            endpoints.iter()
                 .map(|e| format!(
                     r#"    fn handle{}(
         &self, request: &'_ {}<'_>, response: &mut FlatBufferBuilder<'static>
-    ) -> impl Future<Output = Result<(), IpcError>> + Send;
+    ) -> impl Future<Output = Result<(), IpcError>> + Send{}
 "#,
                     camel_to_snake(&e.name),
                     e.request,
+                    if e.ty != Type::Client2Server { ";" } else {
+                        " {
+        async { Err(IpcError::Unsupported) }
+    }"
+                    }
                 ))
                 .collect::<String>(),
             endpoints.iter()
-                .filter(|e| e.ty != Type::Client2Server)
                 .map(|e| format!(
-                    "            {} => handle!(listener, handle{}, {}, {}, body, response),\n",
+                    "        {} => handle!(listener, handle{}, {}, {}, body, response),\n",
                     e.id,
                     camel_to_snake(&e.name),
                     e.request,
@@ -115,12 +119,11 @@ pub async fn handle<T: IpcListener>(
         out_file,
         format!(
             r#"
-/// Client to server requests
 impl IpcChannels {{
 {}
 }}
 "#,
-            endpoints.iter().filter(|e| e.ty != Type::Server2Client)
+            endpoints.iter()
                 .map(|e| format!(
                     r#"    #[inline]
     /// Send a [{}]

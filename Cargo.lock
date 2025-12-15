@@ -207,6 +207,8 @@ dependencies = [
  "futures",
  "interprocess",
  "object-pool",
+ "rand",
+ "rand_chacha",
  "thiserror",
  "tokio",
 ]

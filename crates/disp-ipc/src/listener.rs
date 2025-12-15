@@ -1,3 +1,5 @@
+#![allow(unused_variables)]
+
 use crate::schema::*;
 use crate::error::IpcError;
 use flatbuffers::FlatBufferBuilder;

@@ -20,6 +20,8 @@
 // - The byte-order is native.
 // - `packet_id`: Auto-incrementing packet ID, used for request tracking and synchronization.
 // - `endpoint_id`: As is specified by this file, non-zero.
+//   - `endpoint_id = 0`: A response packet for a request packet with the same `packet_id`.
+//   - `endpoint_id == 0xFFFF_FFFF`: Error response packet.
 // - `length`: The length in bytes of `packet_content`.
 // - `_`: Reserved. We might afford a bit of CRC checking?
 // - `packet_content`: FlatBuffers-encoded content, as is specified in relevant schema files.
@@ -35,5 +37,6 @@ namespace party.iroiro.juicemacs.ipc;
 attribute dir;
 
 rpc_service EditorServer {
-  Ping(PingRequest):PingResponse (id: 1, dir: "2way");
+  Register(RegistrationRequest):RegistrationResponse (id: 1, dir: "c2s");
+  Ping(PingRequest):PingResponse (id: 2, dir: "2way");
 }

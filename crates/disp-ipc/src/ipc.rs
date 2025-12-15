@@ -24,9 +24,12 @@ struct RequestQueueItem {
 enum RequestQueueItemInfo {
     Request {
         endpoint_id: u32,
-        callback: oneshot::Sender<Vec<u8>>,
+        callback: oneshot::Sender<IpcResult<Vec<u8>>>,
     },
     Response {
+        packet_id: u32,
+    },
+    ErrorResponse {
         packet_id: u32,
     },
 }
@@ -36,31 +39,35 @@ struct PacketSender {
     pool: SendBufferPool,
     sender: SendHalf,
     request_queue: mpsc::Receiver<RequestQueueItem>,
-    callback_queue: Arc<DashMap<u32, oneshot::Sender<Vec<u8>>>>,
+    callback_queue: Arc<DashMap<u32, oneshot::Sender<IpcResult<Vec<u8>>>>>,
 
     stopped: oneshot::Receiver<()>,
 }
 impl PacketSender {
     pub async fn run(mut self) -> IpcResult<()> {
+        let mut run_loop = async || -> IpcResult<()> {
+            while let Some(RequestQueueItem { info, body }) = self.request_queue.recv().await {
+                let info = match info {
+                    RequestQueueItemInfo::Request { endpoint_id, callback } => {
+                        let packet_id = self.packet_id.next();
+                        assert!(self.callback_queue.insert(packet_id, callback).is_none());
+                        PacketInfo { packet_id, endpoint_id }
+                    },
+                    RequestQueueItemInfo::Response { packet_id } => {
+                        PacketInfo { packet_id, endpoint_id: 0 }
+                    },
+                    RequestQueueItemInfo::ErrorResponse { packet_id } => {
+                        PacketInfo { packet_id, endpoint_id: u32::MAX }
+                    },
+                };
+                write_packet(&mut self.sender, &info, &body).await?;
+                self.pool.attach(body);
+            }
+            Ok(())
+        };
         tokio::select! {
             _ = self.stopped => Ok(()),
-            result = async {
-                while let Some(RequestQueueItem { info, body }) = self.request_queue.recv().await {
-                    let info = match info {
-                        RequestQueueItemInfo::Request { endpoint_id, callback } => {
-                            let packet_id = self.packet_id.next();
-                            assert!(self.callback_queue.insert(packet_id, callback).is_none());
-                            PacketInfo { packet_id, endpoint_id }
-                        },
-                        RequestQueueItemInfo::Response { packet_id } => {
-                            PacketInfo { packet_id, endpoint_id: 0 }
-                        },
-                    };
-                    write_packet(&mut self.sender, &info, &body).await?;
-                    self.pool.attach(body);
-                }
-                Ok(())
-            } => result,
+            result = run_loop() => result,
         }
     }
 }
@@ -88,7 +95,7 @@ impl PacketSenderSender {
             body,
             info: RequestQueueItemInfo::Request { endpoint_id, callback: tx },
         }).await.map_err(|_| IpcError::BrokenPipeError)?;
-        rx.await.map_err(|_| IpcError::BrokenPipeError)
+        rx.await.map_err(|_| IpcError::BrokenPipeError)?
     }
 }
 
@@ -97,39 +104,55 @@ struct PacketReceiver<T: listener::IpcListener> {
     send_pool: SendBufferPool,
     receiver: BufReader<RecvHalf>,
     sender: mpsc::Sender<RequestQueueItem>,
-    callback_queue: Arc<DashMap<u32, oneshot::Sender<Vec<u8>>>>,
+    callback_queue: Arc<DashMap<u32, oneshot::Sender<IpcResult<Vec<u8>>>>>,
     listener: T,
 
     stopped: oneshot::Receiver<()>,
 }
 impl<T: listener::IpcListener> PacketReceiver<T> {
     pub async fn run(mut self) -> Result<(), IpcError> {
+        let mut run_loop = async || -> Result<(), IpcError> {
+            loop {
+                let (_, mut buffer) = self.recv_pool.pull(Vec::new).detach();
+                let packet_info = read_packet(&mut self.receiver, &mut buffer).await?;
+                if packet_info.endpoint_id == 0 || packet_info.endpoint_id == u32::MAX {
+                    if let Some((_, callback)) = self.callback_queue.remove(&packet_info.packet_id) {
+                        callback.send(if packet_info.endpoint_id == 0 {
+                            Ok(buffer)
+                        } else {
+                            Err(IpcError::RemoteError(buffer))
+                        }).map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                        // TODO: log
+                    } else {
+                        self.recv_pool.attach(buffer);
+                        // TODO: log
+                    }
+                } else {
+                    let (_, mut output) = self.send_pool.pull(FlatBufferBuilder::new).detach();
+                    output.reset();
+                    let result = listener::handle(
+                        &self.listener, packet_info.endpoint_id, &buffer, &mut output,
+                    ).await;
+                    let info = match result {
+                        Ok(()) => RequestQueueItemInfo::Response { packet_id: packet_info.packet_id },
+                        Err(_) => {
+                            output.reset();
+                            let root = crate::schema::IpcError::create(&mut output, &IpcErrorArgs {
+                                type_: IpcErrorType::GenericError, message: None,
+                            });
+                            output.finish(root, None);
+                            RequestQueueItemInfo::ErrorResponse { packet_id: packet_info.packet_id }
+                        }
+                    };
+                    self.sender.send(RequestQueueItem { body: output, info }).await
+                        .map_err(|_| IpcError::BrokenPipeError)?;
+                }
+            }
+        };
+
         tokio::select! {
             _ = self.stopped => Ok(()),
-            result = async {
-                loop {
-                    let (_, mut buffer) = self.recv_pool.pull(Vec::new).detach();
-                    let packet_info = read_packet(&mut self.receiver, &mut buffer).await?;
-                    if packet_info.endpoint_id == 0 {
-                        if let Some((_, callback)) = self.callback_queue.remove(&packet_info.packet_id) {
-                            callback.send(buffer).map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
-                        } else {
-                            self.recv_pool.attach(buffer);
-                            return Err(IpcError::InvalidResponse);
-                        }
-                    } else {
-                        let (_, mut output) = self.send_pool.pull(FlatBufferBuilder::new).detach();
-                        output.reset();
-                        listener::handle(
-                            &self.listener, packet_info.endpoint_id, &buffer, &mut output,
-                        ).await?;
-                        self.sender.send(RequestQueueItem {
-                            body: output,
-                            info: RequestQueueItemInfo::Response { packet_id: packet_info.packet_id },
-                        }).await.map_err(|_| IpcError::BrokenPipeError)?;
-                    }
-                }
-            } => result,
+            result = run_loop() => result,
         }
     }
 }
@@ -189,9 +212,9 @@ impl IpcChannels {
     }
 
     pub async fn close(self) -> Result<(), IpcError> {
-        self.sender_stop.send(()).map_err(|_| IpcError::BrokenPipeError)?;
+        let _ = self.sender_stop.send(());
         self.sender_task.await.map_err(|_| IpcError::BrokenPipeError)??;
-        self.receiver_stop.send(()).map_err(|_| IpcError::BrokenPipeError)?;
+        let _ = self.receiver_stop.send(());
         self.receiver_task.await.map_err(|_| IpcError::BrokenPipeError)??;
         Ok(())
     }
@@ -308,15 +331,49 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_client() {
-        let server = tokio::spawn(async {
+    fn get_test_server_name() -> Name<'static> {
+        let i = rand::random::<u32>();
+        format!("juicemacs-{i}.socket").to_ns_name::<GenericNamespaced>().unwrap()
+    }
+
+    async fn try_test<F1, F2>(test_server: F1, test_client: F2) -> Result<(), IpcError>
+    where F1: Send + Sync + 'static + AsyncFnOnce(&'_ mut IpcChannels),
+          F2: Send + Sync + 'static + AsyncFnOnce(&'_ mut IpcChannels)
+    {
+        let name = get_test_server_name();
+        let name_client = name.clone();
+
+        let (stop, stopped) = oneshot::channel::<()>();
+
+        let server = async move {
             let listener = ListenerOptions::new()
-                .name(get_server_name().unwrap())
+                .name(name)
                 .create_tokio()
                 .unwrap();
             let conn = listener.accept().await.unwrap();
-            let server = IpcChannels::create_ipc_channels(conn, Server(), false);
+            let mut server = IpcChannels::create_ipc_channels(conn, Server(), false);
+            test_server(&mut server).await;
+            stopped.await.unwrap();
+            server.close().await.expect_err("disconnected");
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = async move {
+            let conn = Stream::connect(name_client).await.unwrap();
+            let mut client = IpcChannels::create_ipc_channels(conn, Server(), true);
+            test_client(&mut client).await;
+            client.close().await.unwrap();
+            stop.send(()).unwrap();
+        };
+
+        futures::join!(client, server);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_client() {
+        try_test(async |server| {
             server.ping(|buf| {
                 let ping = buf.create_string("ping from server");
                 Ok(PingRequest::create(buf, &PingRequestArgs { ping: Some(ping) }))
@@ -324,15 +381,7 @@ mod tests {
                 assert_eq!(response.pong(), "ping from server");
                 Ok(())
             }).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            server.close().await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let client = async {
-            let conn = Stream::connect(get_server_name().unwrap()).await.unwrap();
-            let client = IpcChannels::create_ipc_channels(conn, Server(), true);
+        }, async |client| {
             client.ping(|buf| {
                 let ping = buf.create_string("ping from client");
                 Ok(PingRequest::create(buf, &PingRequestArgs { ping: Some(ping) }))
@@ -340,54 +389,58 @@ mod tests {
                 assert_eq!(response.pong(), "ping from client");
                 Ok(())
             }).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            client.close().await.unwrap();
-        };
-
-        client.await;
-        server.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_latency() {
-        let (stop, stopped) = oneshot::channel::<()>();
+        try_test(
+            async |_server| {},
+            async |client| {
+                for msg_size in [16, 128, 1024, 8 * 1024] {
+                    let s = "ping".repeat(msg_size / 4);
+                    let mut latency_sum = 0;
+                    let mut latency_max = 0;
+                    let loop_count = 1000;
+                    for _ in 0..loop_count {
+                        let start = std::time::Instant::now();
+                        let time = client.ping(|buf| {
+                            let ping = buf.create_string(&s);
+                            Ok(PingRequest::create(buf, &PingRequestArgs { ping: Some(ping) }))
+                        }, |response| {
+                            let nanos = start.elapsed().as_nanos();
+                            assert_eq!(response.pong(), &s);
+                            Ok(nanos)
+                        }).await.unwrap();
+                        latency_sum += time;
+                        latency_max = latency_max.max(time);
+                    }
 
-        let server = tokio::spawn(async {
-            let listener = ListenerOptions::new()
-                .name(get_server_name().unwrap())
-                .create_tokio()
-                .unwrap();
-            let conn = listener.accept().await.unwrap();
-            let server = IpcChannels::create_ipc_channels(conn, Server(), false);
-            stopped.await.unwrap();
-            server.close().await.expect_err("disconnected");
-        });
+                    println!(
+                        "latency({} bytes): avg: {} us, max: {} us",
+                        msg_size,
+                        latency_sum as f64 / loop_count as f64 / 1000.0,
+                        latency_max as f64 / 1000.0,
+                    );
+                }
+            },
+        ).await.unwrap();
+    }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let conn = Stream::connect(get_server_name().unwrap()).await.unwrap();
-        let client = IpcChannels::create_ipc_channels(conn, Server(), true);
-        let mut latency = 0;
-        let loop_count = 32_000;
-        for _ in 0..loop_count {
-            let start = std::time::Instant::now();
-            latency += client.ping(|buf| {
-                let ping = buf.create_string("ping from client");
-                Ok(PingRequest::create(buf, &PingRequestArgs { ping: Some(ping) }))
-            }, |response| {
-                let nanos = start.elapsed().as_nanos();
-                assert_eq!(response.pong(), "ping from client");
-                Ok(nanos)
-            }).await.unwrap();
-        }
-
-        println!(
-            "latency: ~ {} us",
-            latency as f64 / loop_count as f64 / 1000.0,
-        );
-
-        client.close().await.unwrap();
-        stop.send(()).unwrap();
-        server.await.unwrap();
+    #[tokio::test]
+    async fn test_unsupported() {
+        try_test(
+            async |_server| {},
+            async |client| {
+                client.register(|buf| {
+                    let type_ = Some(buf.create_string("t"));
+                    let display = Some(buf.create_string(""));
+                    Ok(RegistrationRequest::create(buf, &RegistrationRequestArgs { type_, display }))
+                }, |_success| -> Result<(), IpcError> {
+                    panic!("unreachable");
+                }).await.expect_err("unsupported");
+            },
+        ).await.unwrap();
     }
 }

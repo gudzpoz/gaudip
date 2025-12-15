@@ -14,6 +14,10 @@ pub enum IpcError {
     InvalidResponse,
     #[error("failed internal communication")]
     BrokenPipeError,
+    #[error("unsupported operation")]
+    Unsupported,
+    #[error("remote error")]
+    RemoteError(Vec<u8>),
 }
 
 pub type IpcResult<T> = Result<T, IpcError>;
