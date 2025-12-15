@@ -1,9 +1,9 @@
 namespace party.iroiro.juicemacs.ipc;
 
 table PingRequest {
-  ping: string;
+  ping: string (required);
 }
 
 table PingResponse {
-  pong: string;
+  pong: string (required);
 }

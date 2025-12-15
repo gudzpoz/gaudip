@@ -21,7 +21,7 @@ mod tests {
         let buf = fbb.finished_data();
 
         let ping = flatbuffers::root::<PingRequest<'_>>(buf).unwrap();
-        assert_eq!("ping", ping.ping().unwrap());
+        assert_eq!("ping", ping.ping());
     }
 
     #[test]
@@ -35,6 +35,6 @@ mod tests {
         let buf = fbb.finished_data();
 
         let ping = flatbuffers::root::<PingResponse<'_>>(buf).unwrap();
-        assert_eq!("pong", ping.pong().unwrap());
+        assert_eq!("pong", ping.pong());
     }
 }

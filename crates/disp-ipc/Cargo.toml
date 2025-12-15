@@ -8,8 +8,11 @@ authors = [
 edition.workspace = true
 
 [dependencies]
+dashmap = { workspace = true }
 dirs = { workspace = true }
 flatbuffers = { workspace = true }
+futures = { workspace = true }
 interprocess = { workspace = true, features = ["tokio"] }
 object-pool = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

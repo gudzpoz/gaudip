@@ -7,11 +7,11 @@
 // To ease the burden of code-generation, this file promises that, all IPC endpoints
 // are defined by lines strictly matching the following regular expression:
 //
-//     /^  (\w+)\((\w+)\):(\w+) \(id: (\d+)\);$/
+//     /^  (\w+)\((\w+)\):(\w+) \(id: (\d+), dir: "(c2s|s2c|2way)"\);$/
 //
 // Or, using named capture groups:
 //
-//     /^  (?<endpoint>\w+)\((?<request>\w+)\):(?<response>\w+) \(id: (?<id>\d+)\);$/
+//     /^  (?<endpoint>\w+)\((?<request>\w+)\):(?<response>\w+) \(id: (?<id>\d+), dir: "(?<dir>c2s|s2c|2way)"\);$/
 //
 // # IPC Schema
 //
@@ -19,7 +19,6 @@
 //
 // - The byte-order is native.
 // - `packet_id`: Auto-incrementing packet ID, used for request tracking and synchronization.
-//   - On first connect, the client must make a registration request, with `packet_id = 0`.
 // - `endpoint_id`: As is specified by this file, non-zero.
 // - `length`: The length in bytes of `packet_content`.
 // - `_`: Reserved. We might afford a bit of CRC checking?
@@ -32,6 +31,9 @@ include "buffer.fbs";
 
 namespace party.iroiro.juicemacs.ipc;
 
+/// Request direction, "c2s", "s2c", or "2way".
+attribute dir;
+
 rpc_service EditorServer {
-  Ping(PingRequest):PingResponse (id: 1);
+  Ping(PingRequest):PingResponse (id: 1, dir: "2way");
 }
