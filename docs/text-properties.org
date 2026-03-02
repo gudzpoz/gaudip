@@ -1,19 +1,31 @@
 #+title: Emacs Text Properties
 #+startup: showall
+:PROPERTIES:
+:VISIBILITY: all
+:END:
 
-This documentation is for testing Emacs text properties and overlay properties.
-It's also used to generate our FlatBuffers bindings so as to keep things in
-sync. This file is expected to be viewed from Emacs. You are also expected to be
-familiar with [[info:elisp:Text Props and Strings][the read syntax of Emacs strings]].
+This documentation is for exploring Emacs text properties and overlay
+properties. It's also used to generate our FlatBuffers bindings so as to keep
+things in sync. This file is expected to be viewed from Emacs. You are also
+expected to be familiar with [[info:elisp:Text Props and Strings][the read syntax of Emacs strings]] and [[info:elisp:Circular Objects][circular
+objects]].
 
 You will need to set =find-function-C-source-directory= for extractions to work
 correctly.
 
-#+begin_comment
-Caveat: Currently =:wrap quote= in Babel blocks seems to produce duplicate
-blocks on repeated evaluation (Emacs 30.1). So you might need to be careful when
-using =org-babel-execute-buffer= to update the document.
-#+end_comment
+The generated FlatBuffers schema is at [[file:../crates/disp-ipc/schema/props.fbs]].
+
+#+begin_quote
+Caveat:
+
+- Currently =:wrap quote= in Babel blocks seems to produce duplicate blocks on
+  repeated evaluation (Emacs 30.1). So you might need to be careful when using
+  =org-babel-execute-buffer= to update the document.
+
+- It's quite inconvenient to use =union= in FlatBuffers, so you will find all
+  kinds of hacks to avoid unions in the following definitions (e.g., NaN boxing,
+  bit coding).
+#+end_quote
 
 * Scaffolding
 :PROPERTIES:
@@ -164,9 +176,15 @@ following utility functions generate FlatBuffers code from those Lisp objects:
 
         (`(vec . ,_) "")
 
-        (`(enum ,name . ,enums)
-         (format "enum %s : ubyte {\n%s}\n"
+        (`(,(or 'enum 'bit-enum) ,name . ,enums)
+         (format "enum %s : %s%s {\n%s}\n"
                  (GetName name)
+                 (if (eq 'enum (car def))
+                     "ubyte"
+                   "uint")
+                 (if (eq 'enum (car def))
+                     ""
+                   " (bit_flags)")
                  (cl-loop for enum in enums concat
                           (format "  %s,\n" (get_name enum)))))
 
@@ -182,19 +200,11 @@ following utility functions generate FlatBuffers code from those Lisp objects:
                                          (capitalize n)
                                        n)))))))
 
-        (`(struct ,name . ,fields)
+        (`(,(or 'struct 'table) ,name . ,fields)
          (concat
           (apply #'fbs-gen-all-1 (mapcar #'cdr fields))
-          (format "struct %s {\n%s}\n"
-                  (GetName name)
-                  (cl-loop for field in fields concat
-                           (format "  %s: %s;\n"
-                                   (get_name (car field))
-                                   (GetName (cdr field)))))))
-        (`(table ,name . ,fields)
-         (concat
-          (apply #'fbs-gen-all-1 (mapcar #'cdr fields))
-          (format "table %s {\n%s}\n"
+          (format "%S %s {\n%s}\n"
+                  (car def)
                   (GetName name)
                   (cl-loop for field in fields concat
                            (format "  %s: %s;\n"
@@ -237,31 +247,33 @@ following utility functions generate FlatBuffers code from those Lisp objects:
   - =display-line-numbers-disable= :: =(bool)=
 - *type*:
   - =FaceRef= :: =((struct face-ref (id . int)))=
-  - =LineHeight= :: =((struct line-height (kind . (enum line-height-kind no-effect height-total absolute relative)) (ref-height . int) (ratio . int)))=
+  - =LineHeight= :: =((struct line-height (kind . (enum line-height-kind no-effect height-total absolute relative)) (car . int-float) (cdr . int-float)))=
   - =PrefixSpec= :: =((union prefix-spec EmacsString ImageSpec SpacingSpec))=
   - =Composition= :: =((table composition (length . int) (components . string) (notify . bool)))=
   - =SliceSpec= :: =((struct slice-spec (x . int-float) (y . int-float) (w . int-float) (h . int-float)))=
+  - =MarginSpec= :: =((union margin-spec emacs-string image-spec))=
   - =BitmapRef= :: =((struct bitmap-ref (id . int)))=
   - =FringeSpec= :: =((struct fringe-spec (image . bitmap-ref) (face . face-ref)))=
   - =WhenSpec= :: =((table when-spec (condition . any-form) (display . display-spec)))=
   - =PrioritySpec= :: =((struct priority-spec (primary . uint) (secondary . uint)))=
   - =WindowRef= :: =((struct window-ref (id . int)))=
+  - =Continued= :: =((bit-enum continued min-width display face mouse-face fontified help-echo invisible cursor pointer line-spacing line-height wrap-prefix line-prefix composition display-line-numbers-disable))=
   - =EmacsString= :: =(!)=
   - =AnyForm= :: =((table any-form (atom . bool) (v . int-float)))=
   - =PixelSpec= :: =((table pixel-spec (expr . (vec int)) (vars . (vec string))))=
   - =SpacingSpec= :: =((table spacing-spec (width . pixel-spec) (height . pixel-spec) (relative-width . float) (relative-height . float) (align-to . pixel-spec) (ascent . pixel-spec)))=
   - =ImageType= :: =((enum image-type postscript imagemagick svg png gif tiff jpeg xpm webp xbm pbm))=
   - =PointerEnum= :: =((enum pointer-enum arrow hand text hdrag nhdrag vdrag hourglass modeline))=
-  - =ImageSpec= :: =((table image-spec (kind . image-type) (file . string) (data . (vec ubyte)) (margin . (struct image-margin (x . int) (y . int))) (ascent . bool-int) (relief . int) (width . int) (height . int) (max-width . int) (max-height . int) (scale . float) (rotation . int) (flip . bool) (transform-smoothing . bool) (index . int) (conversion . (enum image-conversion none disabled)) (mask . bool-color) (pointer . pointer-enum) (map-notify . bool)))=
+  - =ImageSpec= :: =((table image-spec (kind . image-type) (file . string) (data . (vec ubyte)) (margin . (struct image-margin (x . int) (y . int))) (ascent . int-float) (relief . int) (width . int) (height . int) (max-width . int) (max-height . int) (scale . float) (rotation . int) (flip . bool) (transform-smoothing . bool) (index . int) (conversion . (enum image-conversion none disabled)) (mask . bool-color) (pointer . pointer-enum) (map-notify . bool)))=
   - =DisplaySpec= :: =(!)=
 - *disp*:
   - =_string= :: =(EmacsString)=
   - =space= :: =(PixelSpec)=
   - =image= :: =(ImageSpec)=
   - =slice= :: =(SliceSpec)=
-  - =(margin nil)= :: =(EmacsString ImageSpec)=
-  - =(margin left-margin)= :: =(EmacsString ImageSpec)=
-  - =(margin right-margin)= :: =(EmacsString ImageSpec)=
+  - =(margin nil)= :: =(MarginSpec)=
+  - =(margin left-margin)= :: =(MarginSpec)=
+  - =(margin right-margin)= :: =(MarginSpec)=
   - =left-fringe= :: =(FringeSpec)=
   - =right-fringe= :: =(FringeSpec)=
   - =space-width= :: =(int float)=
@@ -426,8 +438,8 @@ hope the listing is complete.
   {{{prop(line-height, LineHeight)}}}
 
   {{{type(LineHeight, (struct line-height (kind . (enum line-height-kind
-  no-effect height-total absolute relative)) (ref-height . int) (ratio .
-  int)))}}}
+  no-effect height-total absolute relative)) (car . int-float) (cdr .
+  int-float)))}}}
 
   See [[info:elisp:Line Height][(elisp) Line Height]].
 
@@ -632,11 +644,13 @@ Collected from [[info:elisp:Display Property][(elisp) Display Property]].
 
   - =margin=: another display spec (string/image)
 
-    {{{disp((margin nil), EmacsString | ImageSpec)}}}
+    {{{disp((margin nil), MarginSpec)}}}
 
-    {{{disp((margin left-margin), EmacsString | ImageSpec)}}}
+    {{{disp((margin left-margin), MarginSpec)}}}
 
-    {{{disp((margin right-margin), EmacsString | ImageSpec)}}}
+    {{{disp((margin right-margin), MarginSpec)}}}
+
+    {{{type(MarginSpec, (union margin-spec emacs-string image-spec))}}}
 
     #+begin_src elisp :results silent :var _=util
       (show-string #("string" 0 6 (display ((margin left-margin) "test")))
@@ -682,7 +696,7 @@ Collected from [[info:elisp:Display Property][(elisp) Display Property]].
   - {{{disp(space-width, int | float)}}}
 
     #+begin_src elisp :results silent :var _=util
-      (show-string #("s t r i n g" 0 11 (display (space-width 10))))
+      (show-string #("s t r  i n g" 0 12 (display (space-width 10))))
     #+end_src
 
   - {{{disp(min-width, PixelSpec)}}}
@@ -821,9 +835,178 @@ See [[info:elisp:Overlay Properties][(elisp) Overlay Properties]].
 
 * Types
 
+** Face references
+
+In the =face= property, one may use a symbol to refer to a pre-defined face
+(like =#("abc" 0 3 (face bold))=), or embed a face definition, like =#("abc" 0 3
+(face (:weight bold)))=. However, I really want to avoid using unions, so we
+require using an ID to refer to both pre-defined faces and embedded faces.
+
+Here is one of the ways to do this:
+
+- Pre-defined faces have positive IDs, while embedded faces use temporary
+  negative IDs.
+- All text property responses include a =faces= field, where the actual embed
+  faces (and maybe all used pre-defined faces) are stored.
+- Since the embedded IDs are temporary, the client is responsible for
+  re-assigning embedded faces with unique (negative?) IDs.
+
+** Identity
+
+For some text/display properties, Emacs uses the /identity/ of properties to
+determine their boundaries:
+
+#+begin_quote
+[[info:elisp:Other Display Specs][(elisp) Other Display Specs]]: =(min-width (WIDTH))=:
+
+... The text is partitioned using the identity of the parameter, ...
+#+end_quote
+
+Example properties include:
+
+- =display=:
+
+  Strings:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string"
+                   0 3 (display "replaced")
+                   3 6 (display "replaced")))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string"
+                   0 3 (display #1="replaced")
+                   3 6 (display #1#)))
+  #+end_src
+
+  Replacing properties only look at the top level identity:
+
+  =space=:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("a--b"
+                   1 2 (display (space :width 10))
+                   2 3 (display (space :width 10))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("a--b--c"
+                   1 2 (display #1=(space :width 10))
+                   2 3 (display #1#)
+                   4 5 (display (space . #2=(:width 10)))
+                   5 6 (display (space . #2#))))
+  #+end_src
+
+  =image=:
+
+  #+begin_src elisp :results silent :var _=util
+    (let ((image `(image :type svg :file ,(image-search-load-path "symbols/plus_16.svg"))))
+      (show-string (concat (propertize "str" 'display image)
+                           (propertize "ing" 'display (copy-sequence image)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (let ((image `(image :type svg :file ,(image-search-load-path "symbols/plus_16.svg"))))
+      (show-string (concat (propertize "str" 'display image)
+                           (propertize "ing" 'display image)
+                           "\n"
+                           (propertize "str" 'display (list image))
+                           (propertize "ing" 'display (list image)))))
+  #+end_src
+
+  =slice=:
+
+  #+begin_src elisp :results silent :var _=util
+    (let* ((image `(image :type svg :file ,(image-search-load-path "symbols/plus_16.svg")))
+           (slice '(slice 0 0 10 10))
+           (display (list image slice)))
+      (show-string (concat (propertize "str" 'display display)
+                           (propertize "ing" 'display display)
+                           "\n"
+                           (propertize "str" 'display display)
+                           (propertize "ing" 'display (list image slice)))))
+  #+end_src
+
+  =margin=:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string"
+                   0 3 (display ((margin left-margin) #1="aa"))
+                   3 6 (display ((margin left-margin) #1#)))
+                 nil nil (lambda () (setq left-margin-width 10)))
+  #+end_src
+
+  However, =min-width= (and only it, seemingly) looks deeper:
+
+  =min-width=:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string!"
+                   0 3 (display (min-width (10)))
+                   3 6 (display (min-width (10)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string!"
+                   0 3 (display (min-width #1=(10)))
+                   3 6 (display (min-width #1#))))
+  #+end_src
+
+- =composition=:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string"
+                   0 3 (composition ((3)))
+                   3 6 (composition ((3)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string"
+                   0 3 #1=(composition ((3)))
+                   3 6 #1#))
+  #+end_src
+
+#+begin_quote
+By the way, the =:box= face attribute is not affected by attribute identity:
+
+#+begin_src elisp :results silent :var _=util
+  (show-string #("string"
+                 0 3 (face (:box (:line-width 1 :color "red" :style released-button)))
+                 3 6 (face (:box (:line-width 3 :color "blue" :style pressed-button)))))
+#+end_src
+
+Sigh. Text properties are not meant for spans.
+
+#+begin_src elisp :results silent :var _=util
+  (let* ((s "اَلْفُصْحَىٰ")
+         (ss (copy-sequence s)))
+    (put-text-property 0 5 'face '(button (:box 1)) ss)
+    (show-string (concat ss "\n" s)))
+#+end_src
+#+end_quote
+
+Lisp objects naturally has objects, but it is not the case with serialized
+products. Instead of trying to preserve all those pointer reference semantics, I
+think it's better to just mark the ends of those spans explicitly. This would
+also allow us to transmit less text properties on the wire when only one or two
+properties change.
+
+#+begin_src elisp :var _=util :wrap quote
+  (-->
+   (alist-get 'prop (extract-prop-defs))
+   (mapcar #'car it)
+   (append '("min-width") it)
+   (delete "continued" it)
+   (format "{{{type(Continued, %S)}}}"
+           `(bit-enum continued ,@(mapcar #'intern it))))
+#+end_src
+
+#+RESULTS:
+#+begin_quote
+{{{type(Continued, (bit-enum continued min-width display face mouse-face fontified help-echo invisible cursor pointer line-spacing line-height wrap-prefix line-prefix composition display-line-numbers-disable))}}}
+#+end_quote
+
+** Misc
+
 - {{{type(EmacsString, !)}}}: string + text properties
 
-  #+begin_src flatbuffers :noeval :tangle test.fbs
+  #+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
     /// An Emacs string in special encodings
     table EmacsString {
       /// The underlying data
@@ -834,35 +1017,48 @@ See [[info:elisp:Overlay Properties][(elisp) Overlay Properties]].
       /// - Positive: Encoded in `utf-8-emacs` coding.
       /// - Negative: Encoded in `raw-text` (bytes).
       length: int64;
+      /// Text properties
+      properties: [TextSpan];
+    }
+    table TextSpan {
+      length: int32;
+      continued: int32;
+      properties: TextProps;
     }
   #+end_src
 
 - {{{type(AnyForm, (table any-form (atom . bool) (v . int-float)))}}}: Oh
-  goodness.
+  goodness. Currently this only support static int/float values.
 
 ** Simple ones
 
-#+begin_src flatbuffers :noeval :tangle test.fbs
+I'm still unsure about color representation. Emacs supports [[info:elisp:Color Names][using color strings]]
+(like ="red"=) in place of colors, but those strings are frame dependent,
+meaning that terminal frames and GUI ones can support different colors. But I
+really don't want to add another =union= and a =string= field (partly because
+using =string= in FlatBuffers requires making everything a =table=). I think a
+better way is to let the client send a list of supported colors to the server
+and use the remaining bits for color IDs.
+
+#+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
   /// Workaround for union { bool, uint64 } for colors
   struct BoolColor {
     /// RRRRGGGGBBBBAAAF (F: 0xFF: t; 0: nil; others: color)
     color: uint64;
   }
-  /// Workaround for union { bool, int } for colors
+  /// Workaround for union { bool, int }
   struct BoolInt {
     b: bool;
-    v: uint64;
+    v: int;
   }
   /// Workaround for union { int, float }
   struct IntFloat {
-    /// If the v field should be treated as float32.
-    is_float: bool;
-    /// Value, int or float
+    /// Value, NaN-boxed int or float
     v: int;
   }
 #+end_src
 
-#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs"
   (apply
    #'fbs-gen-all
    (mapcar
@@ -873,7 +1069,7 @@ See [[info:elisp:Overlay Properties][(elisp) Overlay Properties]].
 #+end_src
 
 #+RESULTS:
-#+begin_src flatbuffers :noeval :tangle test.fbs
+#+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
 struct FaceRef {
   id: int;
 }
@@ -885,8 +1081,8 @@ enum LineHeightKind : ubyte {
 }
 struct LineHeight {
   kind: LineHeightKind;
-  ref_height: int;
-  ratio: int;
+  car: IntFloat;
+  cdr: IntFloat;
 }
 union PrefixSpec {
   EmacsString,
@@ -903,6 +1099,10 @@ struct SliceSpec {
   y: IntFloat;
   w: IntFloat;
   h: IntFloat;
+}
+union MarginSpec {
+  EmacsString,
+  ImageSpec,
 }
 struct BitmapRef {
   id: int;
@@ -921,6 +1121,23 @@ struct PrioritySpec {
 }
 struct WindowRef {
   id: int;
+}
+enum Continued : uint (bit_flags) {
+  min_width,
+  display,
+  face,
+  mouse_face,
+  fontified,
+  help_echo,
+  invisible,
+  cursor,
+  pointer,
+  line_spacing,
+  line_height,
+  wrap_prefix,
+  line_prefix,
+  composition,
+  display_line_numbers_disable,
 }
 table AnyForm {
   atom: bool;
@@ -974,7 +1191,7 @@ table ImageSpec {
   file: string;
   data: [ubyte];
   margin: ImageMargin;
-  ascent: BoolInt;
+  ascent: IntFloat;
   relief: int;
   width: int;
   height: int;
@@ -1192,7 +1409,7 @@ enum lface_attribute_index {
 
 That is:
 
-#+begin_src elisp :var attrs=face-attr-types :var _=fbs :wrap "src flatbuffers :noeval :tangle test.fbs"
+#+begin_src elisp :var attrs=face-attr-types :var _=fbs :wrap "src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs"
   (let* ((snippet (extract-snippet "dispextern.h" "^enum lface_attribute_index\n{$" "^  LFACE_VECTOR_SIZE\n};$"))
          (fields
           (mapcar
@@ -1205,7 +1422,7 @@ That is:
 #+end_src
 
 #+RESULTS:
-#+begin_src flatbuffers :noeval :tangle test.fbs
+#+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
 enum FaceWidth : ubyte {
   ultra_condensed,
   extra_condensed,
@@ -1374,7 +1591,7 @@ image displaying?
 
 {{{type(ImageSpec, (table image-spec (kind . image-type) (file . string) (data .
 (vec ubyte)) (margin . (struct image-margin (x . int) (y . int))) (ascent .
-bool-int) (relief . int) (width . int) (height . int) (max-width . int)
+int-float) (relief . int) (width . int) (height . int) (max-width . int)
 (max-height . int) (scale . float) (rotation . int) (flip . bool)
 (transform-smoothing . bool) (index . int) (conversion . (enum image-conversion
 none disabled)) (mask . bool-color) (pointer . pointer-enum) (map-notify .
@@ -1427,7 +1644,7 @@ bool)))}}}
 
 ** Property table
 
-#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs"
   (let ((ex (extract-prop-defs)))
     (cl-loop for entry in '((prop . "TextProps") (over . "OverlayProps"))
              concat (fbs-gen-all `(table ,(cdr entry)
@@ -1442,7 +1659,7 @@ bool)))}}}
 #+end_src
 
 #+RESULTS:
-#+begin_src flatbuffers :noeval :tangle test.fbs
+#+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
 table TextProps {
   display: DisplaySpec;
   face: FaceRef;
@@ -1478,7 +1695,7 @@ table OverlayProps {
 
 {{{type(DisplaySpec, !)}}}
 
-#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs"
   (fbs-gen-all
    `(table display-spec
            ,@(mapcar
@@ -1500,27 +1717,15 @@ table OverlayProps {
 #+end_src
 
 #+RESULTS:
-#+begin_src flatbuffers :noeval :tangle test.fbs
-union MarginNil {
-  EmacsString,
-  ImageSpec,
-}
-union MarginLeftMargin {
-  EmacsString,
-  ImageSpec,
-}
-union MarginRightMargin {
-  EmacsString,
-  ImageSpec,
-}
+#+begin_src flatbuffers :noeval :tangle ../crates/disp-ipc/schema/props.fbs
 table DisplaySpec {
   _string: EmacsString;
   space: PixelSpec;
   image: ImageSpec;
   slice: SliceSpec;
-  margin_nil: MarginNil;
-  margin_left_margin: MarginLeftMargin;
-  margin_right_margin: MarginRightMargin;
+  margin_nil: MarginSpec;
+  margin_left_margin: MarginSpec;
+  margin_right_margin: MarginSpec;
   left_fringe: FringeSpec;
   right_fringe: FringeSpec;
   space_width: IntFloat;
@@ -1541,6 +1746,7 @@ table DisplaySpec {
 - =left-fringe-width/right-fringe-width=
 - =display-line-numbers=
 - =display-pixels-per-inch=
+- =char-property-alias-alist=
 
 ** Display tables
 
