@@ -1,0 +1,1554 @@
+#+title: Emacs Text Properties
+#+startup: showall
+
+This documentation is for testing Emacs text properties and overlay properties.
+It's also used to generate our FlatBuffers bindings so as to keep things in
+sync. This file is expected to be viewed from Emacs. You are also expected to be
+familiar with [[info:elisp:Text Props and Strings][the read syntax of Emacs strings]].
+
+You will need to set =find-function-C-source-directory= for extractions to work
+correctly.
+
+#+begin_comment
+Caveat: Currently =:wrap quote= in Babel blocks seems to produce duplicate
+blocks on repeated evaluation (Emacs 30.1). So you might need to be careful when
+using =org-babel-execute-buffer= to update the document.
+#+end_comment
+
+* Scaffolding
+:PROPERTIES:
+:VISIBILITY: folded
+:END:
+
+** Previews
+
+#+name: util
+#+begin_src elisp :results silent
+  (require 'image)
+
+  (defvar show-string-buffer-name "*string-preview*")
+  (defun show-string (string &optional modes overlays callback)
+    "Insert the STRING into a new buffer and display that.
+
+  MODES are enabled in the buffer. OVERLAYS is a list of (START END .
+  PROPERTIES). START and END start at 0. CALLBACK is called in the new
+  buffer before displaying it."
+    (interactive (list (read t)))
+    (when-let* ((prev (get-buffer show-string-buffer-name)))
+      (kill-buffer prev))
+    (with-current-buffer (get-buffer-create show-string-buffer-name)
+      (dolist (mode modes)
+        (funcall mode +1))
+      (insert string)
+      (goto-char (point-min))
+      (unless (text-property-search-forward 'keymap)
+        (let ((map (make-sparse-keymap)))
+          (keymap-set map (kbd "q") #'quit-window)
+          (put-text-property (point-min) (point-max) 'keymap map)))
+      (dolist (spec overlays)
+        (let ((o (make-overlay (+ (point-min) (car spec))
+                               (+ (point-min) (cadr spec))))
+              (props (cddr spec)))
+          (while props
+            (overlay-put o (pop props) (pop props)))))
+      (goto-char (point-min))
+      (when callback
+        (funcall callback))
+      (pop-to-buffer (current-buffer))))
+#+end_src
+
+** Extraction
+
+We use the following macros to denote GUI related text properties, from which we
+will generate our FlatBuffers schemas:
+
+#+MACRO: prop =$1=: =$2=
+#+MACRO: disp =$1=: =$2=
+#+MACRO: over =$1=: =$2=
+#+MACRO: type =$1=
+
+The following code extracts said macros:
+
+#+name: extract-prop-defs
+#+begin_src elisp :results silent
+  (require 'cl-macs)
+
+  (defun extract-prop-defs ()
+    (let (specs types)
+      (org-element-map (org-element-parse-buffer) 'macro
+        (lambda (macro)
+          (let* ((category (intern (org-element-property :key macro)))
+                 (args (org-element-property :args macro))
+                 (name (car args))
+                 (type (cadr args)))
+            (cl-assert (length< args 3))
+            (when (and type (not (eq 'type category)))
+              (with-temp-buffer
+                (insert type)
+                (goto-char (point-min))
+                (while (re-search-forward "\\w+" nil t)
+                  (push (match-string 0) types))))
+            (cl-assert (not (alist-get name (alist-get category specs) nil #'equal)))
+            (let ((ty (and type (mapcar #'string-trim (string-split type "|")))))
+              (if-let* ((cons (assoc name (alist-get category specs))))
+                  (setcdr cons ty)
+                (push (cons name ty) (alist-get category specs)))))))
+      (setq specs (mapcar (lambda (assoc) (cons (car assoc) (nreverse (cdr assoc))))
+                          specs))
+      (dolist (type (seq-uniq types) (nreverse specs))
+        (unless (or (assoc type (alist-get 'type specs))
+                    (member type fbs-builtin-types))
+          (setf (alist-get type (alist-get 'type specs)) '("unknown"))))))
+#+end_src
+
+And a bit of code for Emacs source extraction:
+
+#+name: source
+#+begin_src elisp :results silent
+  (require 'find-func)
+
+  (defun extract-snippet (c-file region-start-pattern region-end-pattern
+                                 &optional start-line)
+    (with-temp-buffer
+      (insert-file-contents (file-name-concat find-function-C-source-directory c-file))
+      (goto-char (point-min))
+      (re-search-forward region-start-pattern)
+      (forward-line (or start-line 1))
+      (let ((start (point)))
+        (re-search-forward region-end-pattern)
+        (goto-char (match-beginning 0))
+        (forward-line 0)
+        (buffer-substring-no-properties start (point)))))
+#+end_src
+
+** FlatBuffers
+
+We will extract things out of Emacs source code into Lisp structures, and the
+following utility functions generate FlatBuffers code from those Lisp objects:
+
+#+name: fbs
+#+begin_src elisp :results silent
+  (defvar fbs-builtin-types '("bool" "int" "uint" "uint64" "float" "string"
+                              "[ubyte]" "[int]" "[string]"))
+  (defvar fbs-primitives '("bool" "ubyte" "int" "uint64" "float"))
+  (defun get-name (name)
+    (cond
+     ((stringp name) name)
+     ((symbolp name) (symbol-name name))
+     ((consp name)
+      (if (eq 'vec (car name))
+          (format "[%s]" (get-name (cadr name)))
+        (get-name (cadr name))))))
+  (defun GetName (name)
+    (setq name (get-name name))
+    (if (member name fbs-builtin-types)
+        name
+      (mapconcat
+       (lambda (s) (if (<= ?A (aref s 0) ?Z) s
+                     (capitalize s)))
+       (string-split name "[-_]+"))))
+  (defun get_name (name)
+    (setq name (get-name name))
+    (if (member name fbs-builtin-types)
+        name
+      (mapconcat #'identity (string-split name "[-_]+") "_")))
+
+  (defvar fbs-generated nil)
+  (defun fbs-gen (def)
+    (cond
+     ((atom def) "")
+     ((member (get-name (cadr def)) fbs-generated) "")
+     (t
+      (push (get-name (cadr def)) fbs-generated)
+      (pcase-exhaustive def
+
+        (`(vec . ,_) "")
+
+        (`(enum ,name . ,enums)
+         (format "enum %s : ubyte {\n%s}\n"
+                 (GetName name)
+                 (cl-loop for enum in enums concat
+                          (format "  %s,\n" (get_name enum)))))
+
+        (`(union ,name . ,unions)
+         (concat
+          (apply #'fbs-gen-all-1 unions)
+          (format "union %s {\n%s}\n"
+                  (GetName name)
+                  (cl-loop for union in unions concat
+                           (format "  %s,\n"
+                                   (let ((n (GetName union)))
+                                     (if (member n fbs-primitives)
+                                         (capitalize n)
+                                       n)))))))
+
+        (`(struct ,name . ,fields)
+         (concat
+          (apply #'fbs-gen-all-1 (mapcar #'cdr fields))
+          (format "struct %s {\n%s}\n"
+                  (GetName name)
+                  (cl-loop for field in fields concat
+                           (format "  %s: %s;\n"
+                                   (get_name (car field))
+                                   (GetName (cdr field)))))))
+        (`(table ,name . ,fields)
+         (concat
+          (apply #'fbs-gen-all-1 (mapcar #'cdr fields))
+          (format "table %s {\n%s}\n"
+                  (GetName name)
+                  (cl-loop for field in fields concat
+                           (format "  %s: %s;\n"
+                                   (get_name (car field))
+                                   (GetName (cdr field)))))))))))
+  (defun fbs-gen-all-1 (&rest defs)
+    (mapconcat #'fbs-gen defs))
+  (defun fbs-gen-all (&rest defs)
+    (let ((fbs-generated nil))
+      (mapconcat #'fbs-gen defs)))
+#+end_src
+
+* Structured Info
+
+#+begin_src elisp :wrap quote :var _=extract-prop-defs
+  (cl-loop for spec in (extract-prop-defs)
+           concat (format "- *%S*:\n" (car spec))
+           concat (cl-loop for field in (cdr spec)
+                           concat (format "  - =%s= :: =%s=\n"
+                                          (car field)
+                                          (or (cdr field) "?"))))
+#+end_src
+
+#+RESULTS:
+#+begin_quote
+- *prop*:
+  - =display= :: =(DisplaySpec)=
+  - =face= :: =(FaceRef)=
+  - =mouse-face= :: =(FaceRef)=
+  - =fontified= :: =(bool)=
+  - =help-echo= :: =(bool)=
+  - =invisible= :: =(bool)=
+  - =cursor= :: =(bool int)=
+  - =pointer= :: =(PointerEnum)=
+  - =line-spacing= :: =(LineHeight)=
+  - =line-height= :: =(LineHeight)=
+  - =wrap-prefix= :: =(PrefixSpec)=
+  - =line-prefix= :: =(PrefixSpec)=
+  - =composition= :: =(Composition)=
+  - =display-line-numbers-disable= :: =(bool)=
+- *type*:
+  - =FaceRef= :: =((struct face-ref (id . int)))=
+  - =LineHeight= :: =((struct line-height (kind . (enum line-height-kind no-effect height-total absolute relative)) (ref-height . int) (ratio . int)))=
+  - =PrefixSpec= :: =((union prefix-spec EmacsString ImageSpec SpacingSpec))=
+  - =Composition= :: =((table composition (length . int) (components . string) (notify . bool)))=
+  - =SliceSpec= :: =((struct slice-spec (x . int-float) (y . int-float) (w . int-float) (h . int-float)))=
+  - =BitmapRef= :: =((struct bitmap-ref (id . int)))=
+  - =FringeSpec= :: =((struct fringe-spec (image . bitmap-ref) (face . face-ref)))=
+  - =WhenSpec= :: =((table when-spec (condition . any-form) (display . display-spec)))=
+  - =PrioritySpec= :: =((struct priority-spec (primary . uint) (secondary . uint)))=
+  - =WindowRef= :: =((struct window-ref (id . int)))=
+  - =EmacsString= :: =(!)=
+  - =AnyForm= :: =((table any-form (atom . bool) (v . int-float)))=
+  - =PixelSpec= :: =((table pixel-spec (expr . (vec int)) (vars . (vec string))))=
+  - =SpacingSpec= :: =((table spacing-spec (width . pixel-spec) (height . pixel-spec) (relative-width . float) (relative-height . float) (align-to . pixel-spec) (ascent . pixel-spec)))=
+  - =ImageType= :: =((enum image-type postscript imagemagick svg png gif tiff jpeg xpm webp xbm pbm))=
+  - =PointerEnum= :: =((enum pointer-enum arrow hand text hdrag nhdrag vdrag hourglass modeline))=
+  - =ImageSpec= :: =((table image-spec (kind . image-type) (file . string) (data . (vec ubyte)) (margin . (struct image-margin (x . int) (y . int))) (ascent . bool-int) (relief . int) (width . int) (height . int) (max-width . int) (max-height . int) (scale . float) (rotation . int) (flip . bool) (transform-smoothing . bool) (index . int) (conversion . (enum image-conversion none disabled)) (mask . bool-color) (pointer . pointer-enum) (map-notify . bool)))=
+  - =DisplaySpec= :: =(!)=
+- *disp*:
+  - =_string= :: =(EmacsString)=
+  - =space= :: =(PixelSpec)=
+  - =image= :: =(ImageSpec)=
+  - =slice= :: =(SliceSpec)=
+  - =(margin nil)= :: =(EmacsString ImageSpec)=
+  - =(margin left-margin)= :: =(EmacsString ImageSpec)=
+  - =(margin right-margin)= :: =(EmacsString ImageSpec)=
+  - =left-fringe= :: =(FringeSpec)=
+  - =right-fringe= :: =(FringeSpec)=
+  - =space-width= :: =(int float)=
+  - =min-width= :: =(PixelSpec)=
+  - =height= :: =(AnyForm)=
+  - =raise= :: =(int float)=
+  - =when= :: =(WhenSpec)=
+- *over*:
+  - =priority= :: =(PrioritySpec)=
+  - =window= :: =(WindowRef)=
+  - =face= :: =(FaceRef)=
+  - =mouse-face= :: =(FaceRef)=
+  - =display= :: =(DisplaySpec)=
+  - =invisible= :: =(bool)=
+  - =before-string= :: =(EmacsString)=
+  - =after-string= :: =(EmacsString)=
+  - =wrap-prefix= :: =(PrefixSpec)=
+  - =line-prefix= :: =(PrefixSpec)=
+  - =display-line-numbers-disable= :: =(bool)=
+#+end_quote
+
+* Text Properties
+
+These are the text properties documented in [[info:elisp:Special Properties][(elisp) Special Properties]]. Let's
+hope the listing is complete.
+
+** Special Properties
+
+- {{{prop(display, DisplaySpec)}}}
+
+  See [[Display Properties]]
+
+- {{{prop(face, FaceRef)}}}
+
+  {{{type(FaceRef, (struct face-ref (id . int)))}}}: symbol or inlined face. See
+  [[Face]].
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (face italic)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (face (italic error link))))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (font-lock-face italic)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (font-lock-face italic)) '(font-lock-mode))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (display #("alternative" 0 11 (face italic)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (display #("alternative" 0 11 (font-lock-face italic)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (display #("alternative" 0 11 (font-lock-face italic)))) '(font-lock-mode))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (face (:inverse-video t))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("dither" 0 6 (face (:stipple (2 2 "\1\2")))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("dither" 0 6 (face (:foreground "red" :stipple (2 2 "\1\2")))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("dither" 0 6 (face (:inverse-video t :foreground "red" :stipple (2 2 "\1\2")))))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 0 7 (face (:background "red"))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 0 7 (face (:background "red" :extend t))))
+  #+end_src
+
+  When =font-lock-mode= is enabled, =font-lock-face= is added to
+  =char-property-alias-alist= as an alias to =face=.
+
+- {{{prop(mouse-face, FaceRef)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 6 (mouse-face (italic error link))))
+  #+end_src
+
+  Everything affecting font size seems to get ignored, including italics and
+  bold styles...
+
+- =cursor-face=: N/A
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (cursor-face (italic error link))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (cursor-face (italic error link))) '(cursor-face-highlight-mode))
+  #+end_src
+
+  This property gets read by =cursor-face-highlight-mode= and is implemented via
+  an overlay. So, we don't need to handle this.
+
+- {{{prop(fontified, bool)}}}
+
+  Probably should be addressed at the Lisp side.
+
+- {{{prop(help-echo, bool)}}} (and =help-echo-inhibit-substitution=)
+
+  {{{prop(left-fringe-help, bool}}}
+
+  {{{prop(right-fringe-help, bool}}}
+
+  =bool= flag to require c2s events. Otherwise handled with lisp code; involves
+  =show-help-function=. By the way, message display in minibuffers seems
+  implemented via overlays.
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (help-echo #("what?" 0 5 (face error)))))
+  #+end_src
+
+- =keymap=, =local-map=, =syntax-table=, =read-only=, =inhibit-read-only=,
+  =inhibit-isearch=, =intangible=, =cursor-intangible=, =field=, =*-hooks=,
+  =point-entered=, =point-left=: Lisp side.
+
+- {{{prop(invisible, bool)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (invisible t)))
+  #+end_src
+
+- {{{prop(cursor, bool | int)}}}
+
+  Try moving your cursor char by char all the way to the end:
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil '((1 4 display #("substitution"))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil '((1 4 display #("substitution" 3 4 (cursor t)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil '((1 4 display #("substitution" 3 6 (cursor t) 9 12 (cursor t)))))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>0123456789abcdefg" nil '((1 4 display #("substitution" 3 4 (cursor 10)))))
+  #+end_src
+
+  Let's consider not supporting integer =cursor= properties.
+
+- {{{prop(pointer, PointerEnum)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 0 3 (pointer hourglass) 3 6 (pointer hand)))
+  #+end_src
+
+- {{{prop(line-spacing, LineHeight)}}}
+
+  {{{prop(line-height, LineHeight)}}}
+
+  {{{type(LineHeight, (struct line-height (kind . (enum line-height-kind
+  no-effect height-total absolute relative)) (ref-height . int) (ratio .
+  int)))}}}
+
+  See [[info:elisp:Line Height][(elisp) Line Height]].
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 0 6 (line-height 2.0)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-height 2.0)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-height 200)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-height (default . 2.0))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-height (2.0 2.0))))
+  #+end_src
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-spacing 2.0)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-height 2.0)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string\n" 6 7 (line-spacing 2.0 line-height 2.0)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string (concat
+                  (mapconcat (lambda (_) "string") (make-list 100 nil))
+                  #("string\n" 6 7 (line-spacing 2.0 line-height 2.0))))
+  #+end_src
+
+- {{{prop(wrap-prefix, PrefixSpec)}}}
+
+  {{{prop(line-prefix, PrefixSpec)}}}
+
+  {{{type(PrefixSpec, (union prefix-spec EmacsString ImageSpec SpacingSpec))}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string (propertize (mapconcat (lambda (_) "string") (make-list 100 nil))
+                             'line-prefix #(">>>" 0 3 (face error))
+                             'wrap-prefix #("~~~" 0 3 (face italic))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string (let ((s (mapconcat (lambda (_) "string") (make-list 100 nil))))
+                   (concat s
+                           (propertize s
+                                       'line-prefix #(">>>" 0 3 (face error))
+                                       'wrap-prefix #("~~~" 0 3 (face italic))))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string (let ((s (mapconcat (lambda (_) "string") (make-list 100 nil))))
+                   (concat s
+                           (propertize s
+                                       'wrap-prefix '(space :align-to center)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string (let ((s (mapconcat (lambda (_) "string") (make-list 100 nil))))
+                   (concat
+                    s
+                    (propertize
+                     s
+                     'wrap-prefix `(image :type svg :file ,(image-search-load-path "symbols/plus_16.svg"))))))
+  #+end_src
+
+- =cursor-sensor-functions=: N/A
+
+  Handled by =cursor-sensor-mode=.
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (cursor-sensor-functions ((lambda (_ _ what) (message "%S!" what)))))
+                 '(cursor-sensor-mode))
+  #+end_src
+
+- {{{prop(composition, Composition)}}}
+
+  {{{type(Composition, (table composition (length . int) (components . string)
+  (notify . bool)))}}}
+
+  "the value of the property itself is completely internal to Emacs"
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (composition ((3)))))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("string" 3 6 (composition (10 3 [?i ?n ?g]))))
+  #+end_src
+
+  See the comments on top of =composite.c= to make sense of these values. Or, we
+  can also invent our own convention in
+  =compose-region-internal/compose-string-internal=.
+
+- =minibuffer-message=: N/A. Handled by =set-message-function=.
+
+- {{{prop(display-line-numbers-disable, bool)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("line1\nline2\nline3\n" 6 12 (display-line-numbers-disable t))
+                 '(display-line-numbers-mode))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("line1\nline2\nline3\n" 11 12 (display-line-numbers-disable t))
+                 '(display-line-numbers-mode))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("line1\nline2\nline3\n" 6 7 (display-line-numbers-disable t))
+                 '(display-line-numbers-mode))
+  #+end_src
+
+** Display Properties
+
+Collected from [[info:elisp:Display Property][(elisp) Display Property]].
+
+- Replacing specs:
+
+  - Strings: Doesn't support nested replacing.
+
+    {{{disp(_string, EmacsString)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display "replaced")))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display ("list" "of" "specs"))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display #("no-nesting" 0 10 (display "nested")))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display #("replaced" 2 8 (invisible t)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (invisible t) 3 4 (display "replaced")))
+    #+end_src
+
+    Examples from the manual:
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("123"
+                     0 1 (display #(" [ " 0 3 (face (:box t))))
+                     1 2 (face (:box t))
+                     2 3 (display #(" ] " 0 3 (face (:box t))))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("123"
+                     0 1 (face (:box t) display " [ ")
+                     1 2 (face (:box t))
+                     2 3 (face (:box t) display " ] ")))
+    #+end_src
+
+    Well, =:box= is certainly going to be a disaster.
+
+  - {{{disp(space, PixelSpec)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("stringtail" 0 6 (display (space :width 10.0))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("stringtail" 0 6 (display ((space :width 10.0)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #(" centered" 0 1 (display (space :align-to (- center 4)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #(" centered" 0 1 (display (space :align-to 40))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #(" centered" 0 1 (display (space :align-to (40)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 2 (display (space :height 4))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (setq my-var 100)
+      (show-string #("string" 0 2 (display (space :width (+ my-var 0)))))
+    #+end_src
+
+    Oh my god, it can access arbitrary variables.
+
+  - {{{disp(image, ImageSpec)}}}
+
+    {{{disp(slice, SliceSpec)}}}
+
+    {{{type(SliceSpec, (struct slice-spec (x . int-float) (y . int-float) (w .
+    int-float) (h . int-float)))}}}
+
+    See [[=ImageSpec=]].
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string (propertize "string"
+                               'display
+                               `(image :type svg :file ,(image-search-load-path "symbols/plus_16.svg"))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string (propertize "string"
+                               'display
+                               `((slice 0 0 10 10)
+                                 (image :type svg :file ,(image-search-load-path "symbols/plus_16.svg")))))
+    #+end_src
+
+  - =margin=: another display spec (string/image)
+
+    {{{disp((margin nil), EmacsString | ImageSpec)}}}
+
+    {{{disp((margin left-margin), EmacsString | ImageSpec)}}}
+
+    {{{disp((margin right-margin), EmacsString | ImageSpec)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display ((margin left-margin) "test")))
+                   nil nil (lambda () (setq left-margin-width 10)))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string (concat
+                    (propertize "str"
+                                'display
+                                `((margin left-margin)
+                                  (image :type svg :file ,(image-search-load-path "symbols/plus_16.svg"))))
+                    #("ing" 0 3 (display ((margin left-margin) "test"))))
+                   nil nil (lambda () (setq left-margin-width 10)))
+    #+end_src
+
+    Luckily, no ligatures:
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string"
+                     0 2 (display ((margin left-margin) "ل"))
+                     2 4 (display ((margin left-margin) "ـ"))
+                     4 6 (display ((margin left-margin) "ل")))
+                   nil nil (lambda () (setq left-margin-width 10)))
+    #+end_src
+
+  - {{{disp(left-fringe, FringeSpec)}}}
+
+    {{{disp(right-fringe, FringeSpec)}}}
+
+    {{{type(BitmapRef, (struct bitmap-ref (id . int)))}}}
+
+    {{{type(FringeSpec, (struct fringe-spec (image . bitmap-ref) (face . face-ref)))}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 6 (display (left-fringe right-arrow)))
+                   nil nil (lambda () (setq left-fringe-width 50)))
+    #+end_src
+
+    And, why are =margin=, =left/right-fringe= /replacing/ specs?
+
+- Others:
+
+  - {{{disp(space-width, int | float)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("s t r i n g" 0 11 (display (space-width 10))))
+    #+end_src
+
+  - {{{disp(min-width, PixelSpec)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display (min-width (10)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display (min-width ((- (0.5 . text) 3))))))
+    #+end_src
+
+  - {{{disp(height, AnyForm)}}}
+
+    Numbers are ratios:
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display (height 2))))
+    #+end_src
+
+    Expressions return absolute font sizes:
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display ((height random)))))
+    #+end_src
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display ((height (* (1+ (random 5)) height))))))
+    #+end_src
+
+  - {{{disp(raise, int | float)}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display (raise 2))))
+    #+end_src
+
+  - {{{disp(when, WhenSpec)}}}
+
+    {{{type(WhenSpec, (table when-spec (condition . any-form) (display .
+    display-spec)))}}}
+
+    #+begin_src elisp :results silent :var _=util
+      (show-string #("string" 0 3 (display (when (< (random 2) 1) raise 2))))
+    #+end_src
+
+* Overlay Properties
+
+See [[info:elisp:Overlay Properties][(elisp) Overlay Properties]].
+
+- {{{over(priority, PrioritySpec)}}}
+
+  {{{type(PrioritySpec, (struct priority-spec (primary . uint) (secondary . uint)))}}}
+
+  Positive integer or cons of integers or =(nil . N)=.
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil '((1 4 priority 0 face error)
+                               (1 4 priority 1 face default)))
+  #+end_src
+
+- {{{over(window, WindowRef)}}}
+
+  {{{type(WindowRef, (struct window-ref (id . int)))}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil `((1 4 window ,(selected-window) face error)))
+  #+end_src
+
+- =category=: N/A
+
+- {{{over(face, FaceRef)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil `((1 4 face (italic error))))
+  #+end_src
+
+- {{{over(mouse-face, FaceRef)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "<str>" nil `((1 4 face italic mouse-face error)))
+  #+end_src
+
+- {{{over(display, DisplaySpec)}}}
+
+  See [[Display Properties]].
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("<str>" 1 3 (invisible t)) nil `((1 4 display "replaced")))
+  #+end_src
+
+- =help-echo=, =field=, =*-hooks=, and others: N/A
+
+- {{{over(invisible, bool)}}}
+
+- {{{over(before-string, EmacsString)}}}
+
+  {{{over(after-string, EmacsString)}}}
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string "str" nil
+                 '((0 3
+                      before-string "<"
+                      after-string ">")))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string "str" nil
+                 '((0 3
+                      before-string #("<" 0 1 (display #("(((" 0 3 (display "[[[[[["))))
+                      after-string #("<" 0 1 (display #(")))" 0 3 (display "]]]]]]")))))))
+  #+end_src
+
+- {{{over(wrap-prefix, PrefixSpec)}}}
+
+  {{{over(line-prefix, PrefixSpec)}}}
+
+  See above.
+
+- =evaporate=: N/A.
+
+- {{{over(display-line-numbers-disable, bool)}}}
+
+  See above.
+
+  Empty overlay at the end of the buffer with this property is allowed and effective.
+
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("line1\nline2\nline3\n")
+                 '(display-line-numbers-mode)
+                 '((6 12 display-line-numbers-disable t)))
+  #+end_src
+  #+begin_src elisp :results silent :var _=util
+    (show-string #("line1\nline2\nline3")
+                 '(display-line-numbers-mode)
+                 '((17 17 display-line-numbers-disable t)))
+  #+end_src
+
+- =keymap=, =local-map=: See above.
+
+* Types
+
+- {{{type(EmacsString, !)}}}: string + text properties
+
+  #+begin_src flatbuffers :noeval :tangle test.fbs
+    /// An Emacs string in special encodings
+    table EmacsString {
+      /// The underlying data
+      data: [ubyte] (required);
+      /// The length in chars and encoding info
+      ///
+      /// The length is signed:
+      /// - Positive: Encoded in `utf-8-emacs` coding.
+      /// - Negative: Encoded in `raw-text` (bytes).
+      length: int64;
+    }
+  #+end_src
+
+- {{{type(AnyForm, (table any-form (atom . bool) (v . int-float)))}}}: Oh
+  goodness.
+
+** Simple ones
+
+#+begin_src flatbuffers :noeval :tangle test.fbs
+  /// Workaround for union { bool, uint64 } for colors
+  struct BoolColor {
+    /// RRRRGGGGBBBBAAAF (F: 0xFF: t; 0: nil; others: color)
+    color: uint64;
+  }
+  /// Workaround for union { bool, int } for colors
+  struct BoolInt {
+    b: bool;
+    v: uint64;
+  }
+  /// Workaround for union { int, float }
+  struct IntFloat {
+    /// If the v field should be treated as float32.
+    is_float: bool;
+    /// Value, int or float
+    v: int;
+  }
+#+end_src
+
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+  (apply
+   #'fbs-gen-all
+   (mapcar
+    (lambda (type)
+      (cl-assert (length= (cdr type) 1))
+      (read (cadr type)))
+    (alist-get 'type (extract-prop-defs))))
+#+end_src
+
+#+RESULTS:
+#+begin_src flatbuffers :noeval :tangle test.fbs
+struct FaceRef {
+  id: int;
+}
+enum LineHeightKind : ubyte {
+  no_effect,
+  height_total,
+  absolute,
+  relative,
+}
+struct LineHeight {
+  kind: LineHeightKind;
+  ref_height: int;
+  ratio: int;
+}
+union PrefixSpec {
+  EmacsString,
+  ImageSpec,
+  SpacingSpec,
+}
+table Composition {
+  length: int;
+  components: string;
+  notify: bool;
+}
+struct SliceSpec {
+  x: IntFloat;
+  y: IntFloat;
+  w: IntFloat;
+  h: IntFloat;
+}
+struct BitmapRef {
+  id: int;
+}
+struct FringeSpec {
+  image: BitmapRef;
+  face: FaceRef;
+}
+table WhenSpec {
+  condition: AnyForm;
+  display: DisplaySpec;
+}
+struct PrioritySpec {
+  primary: uint;
+  secondary: uint;
+}
+struct WindowRef {
+  id: int;
+}
+table AnyForm {
+  atom: bool;
+  v: IntFloat;
+}
+table PixelSpec {
+  expr: [int];
+  vars: [string];
+}
+table SpacingSpec {
+  width: PixelSpec;
+  height: PixelSpec;
+  relative_width: float;
+  relative_height: float;
+  align_to: PixelSpec;
+  ascent: PixelSpec;
+}
+enum ImageType : ubyte {
+  postscript,
+  imagemagick,
+  svg,
+  png,
+  gif,
+  tiff,
+  jpeg,
+  xpm,
+  webp,
+  xbm,
+  pbm,
+}
+enum PointerEnum : ubyte {
+  arrow,
+  hand,
+  text,
+  hdrag,
+  nhdrag,
+  vdrag,
+  hourglass,
+  modeline,
+}
+struct ImageMargin {
+  x: int;
+  y: int;
+}
+enum ImageConversion : ubyte {
+  none,
+  disabled,
+}
+table ImageSpec {
+  kind: ImageType;
+  file: string;
+  data: [ubyte];
+  margin: ImageMargin;
+  ascent: BoolInt;
+  relief: int;
+  width: int;
+  height: int;
+  max_width: int;
+  max_height: int;
+  scale: float;
+  rotation: int;
+  flip: bool;
+  transform_smoothing: bool;
+  index: int;
+  conversion: ImageConversion;
+  mask: BoolColor;
+  pointer: PointerEnum;
+  map_notify: bool;
+}
+#+end_src
+
+** Face
+
+See [[info:elisp:Faces][(elisp) Faces]].
+
+And there's also [[info:elisp:Fontsets][(elisp) Fontsets]].
+
+From =dispextern.c=, pretty much these:
+
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (concat
+   "enum lface_attribute_index {\n"
+   (extract-snippet "dispextern.h" "^enum lface_attribute_index\n{$" "^  LFACE_VECTOR_SIZE\n};$")
+   "};\n")
+#+end_src
+
+#+RESULTS:
+#+begin_src c :noeval
+enum lface_attribute_index {
+  LFACE_FAMILY_INDEX = 1,
+  LFACE_FOUNDRY_INDEX,
+  LFACE_SWIDTH_INDEX,
+  LFACE_HEIGHT_INDEX,
+  LFACE_WEIGHT_INDEX,
+  LFACE_SLANT_INDEX,
+  LFACE_UNDERLINE_INDEX,
+  LFACE_INVERSE_INDEX,
+  LFACE_FOREGROUND_INDEX,
+  LFACE_BACKGROUND_INDEX,
+  LFACE_STIPPLE_INDEX,
+  LFACE_OVERLINE_INDEX,
+  LFACE_STRIKE_THROUGH_INDEX,
+  LFACE_BOX_INDEX,
+  LFACE_FONT_INDEX,
+  LFACE_INHERIT_INDEX,
+  LFACE_FONTSET_INDEX,
+  LFACE_DISTANT_FOREGROUND_INDEX,
+  LFACE_EXTEND_INDEX,
+};
+#+end_src
+
+*** Per face attribute extration
+
+#+name: face-util
+#+begin_src elisp :results silent
+  (defun extract-face-enums (snippet)
+    (mapcar
+     (lambda (line) (and (string-match "\"\\([^\"]+\\)\"" line)
+                         (match-string 1 line)))
+     (string-lines snippet t)))
+  (defun extract-hard-enums (snippet)
+    (mapcar
+     (lambda (line) (and (string-match "\\_<Q\\([a-z_]+\\)\\_>" line)
+                         (match-string 1 line)))
+     (string-lines snippet t)))
+#+end_src
+
+#+name: width
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (extract-snippet "font.c" "^static const struct table_entry width_table\\[\\] =\n{$" "^};$")
+#+end_src
+
+#+RESULTS: width
+#+begin_src c :noeval
+  { 50, { "ultra-condensed", "ultracondensed" }},
+  { 63, { "extra-condensed", "extracondensed" }},
+  { 75, { "condensed", "compressed", "narrow" }},
+  { 87, { "semi-condensed", "semicondensed", "demicondensed" }},
+  { 100, { "normal", "medium", "regular", "unspecified" }},
+  { 113, { "semi-expanded", "semiexpanded", "demiexpanded" }},
+  { 125, { "expanded" }},
+  { 150, { "extra-expanded", "extraexpanded" }},
+  { 200, { "ultra-expanded", "ultraexpanded", "wide" }}
+#+end_src
+
+#+name: weight
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (extract-snippet "font.c" "^static const struct table_entry weight_table\\[\\] =\n{$" "^};$")
+#+end_src
+
+#+RESULTS: weight
+#+begin_src c :noeval
+  { 0, { "thin" }},
+  { 40, { "ultra-light", "ultralight", "extra-light", "extralight" }},
+  { 50, { "light" }},
+  { 55, { "semi-light", "semilight", "demilight" }},
+  { 80, { "regular", "normal", "unspecified", "book" }},
+  { 100, { "medium" }},
+  { 180, { "semi-bold", "semibold", "demibold", "demi-bold", "demi" }},
+  { 200, { "bold" }},
+  { 205, { "extra-bold", "extrabold", "ultra-bold", "ultrabold" }},
+  { 210, { "black", "heavy" }},
+  { 250, { "ultra-heavy", "ultraheavy" }}
+#+end_src
+
+#+name: slant
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (extract-snippet "font.c" "^static const struct table_entry slant_table\\[\\] =\n{$" "^};$")
+#+end_src
+
+#+RESULTS: slant
+#+begin_src c :noeval
+  { 0, { "reverse-oblique", "ro" }},
+  { 10, { "reverse-italic", "ri" }},
+  { 100, { "normal", "r", "unspecified" }},
+  { 200, { "italic" ,"i", "ot" }},
+  { 210, { "oblique", "o" }}
+#+end_src
+
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (extract-snippet "xfaces.c" "^[\t ]+if (EQ (value, Qline))$" "[\t ]+}$" 0)
+#+end_src
+
+#+RESULTS:
+#+begin_src c :noeval
+              if (EQ (value, Qline))
+                face->underline = FACE_UNDERLINE_SINGLE;
+              else if (EQ (value, Qdouble_line))
+                face->underline = FACE_UNDERLINE_DOUBLE_LINE;
+              else if (EQ (value, Qwave))
+                face->underline = FACE_UNDERLINE_WAVE;
+              else if (EQ (value, Qdots))
+                face->underline = FACE_UNDERLINE_DOTS;
+              else if (EQ (value, Qdashes))
+                face->underline = FACE_UNDERLINE_DASHES;
+              else
+                face->underline = FACE_UNDERLINE_SINGLE;
+#+end_src
+
+#+name: ustyle
+#+begin_src elisp :var _=source :var _=face-util
+  (delq nil
+        (extract-hard-enums
+         (extract-snippet "xfaces.c" "^[\t ]+if (EQ (value, Qline))$" "[\t ]+}$" 0)))
+#+end_src
+
+#+RESULTS: ustyle
+
+#+begin_src elisp :var _=source :wrap "src c :noeval"
+  (extract-snippet "xfaces.c" "^[\t ]+if (EQ (value, Qreleased_button))$" "[\t ]+}$" 0)
+#+end_src
+
+#+RESULTS:
+#+begin_src c :noeval
+              if (EQ (value, Qreleased_button))
+                face->box = FACE_RAISED_BOX;
+              else if (EQ (value, Qpressed_button))
+                face->box = FACE_SUNKEN_BOX;
+              else if (EQ (value, Qflat_button))
+                {
+                  face->box = FACE_SIMPLE_BOX;
+                  /* Don't override colors set in this box. */
+                  if (!set_color)
+                    face->box_color = face->background;
+#+end_src
+
+#+name: bstyle
+#+begin_src elisp :var _=source :var _=face-util
+  (delq nil
+        (extract-hard-enums
+         (extract-snippet "xfaces.c" "^[\t ]+if (EQ (value, Qreleased_button))$" "[\t ]+}$" 0)))
+#+end_src
+
+#+RESULTS: bstyle
+| released_button | pressed_button | flat_button |
+
+*** Types of each face attribute
+
+#+name: face-attr-types
+#+begin_src elisp :results silent :var width=width :var weight=weight :var slant=slant :var ustyle=ustyle :var bstyle=bstyle
+  `((family  string)
+    (foundry string)
+    (height int-float) ; TODO: a function?
+    (swidth (enum face-width  . ,(extract-face-enums width))) ; :width
+    (weight (enum face-weight . ,(extract-face-enums weight)))
+    (slant  (enum face-slant  . ,(extract-face-enums slant)))
+    (foreground         bool-color)
+    (distant-foreground bool-color)
+    (background         bool-color)
+    (underline (struct face-underline
+                       (color . bool-color)
+                       (style . (enum underline-style . ,ustyle))
+                       (position . int)))
+    (overline       bool-color)
+    (strike_through bool-color)
+    (box (struct face-box
+                 (line-width . (struct line-width
+                                       (vwidth . int)
+                                       (hwidth . int)))
+                 (color . bool-color)
+                 (style . (enum box-style . ,bstyle))))
+    (inverse bool) ; :inverse-video
+    (stipple int)          ; TODO: bitmap reference
+    (inherit (vec int))    ; TODO: face reference
+    (font string)          ; TODO: I don't want to support this...
+    (fontset (vec string)) ; TODO: Nor this.
+    (extend bool))
+#+end_src
+
+That is:
+
+#+begin_src elisp :var attrs=face-attr-types :var _=fbs :wrap "src flatbuffers :noeval :tangle test.fbs"
+  (let* ((snippet (extract-snippet "dispextern.h" "^enum lface_attribute_index\n{$" "^  LFACE_VECTOR_SIZE\n};$"))
+         (fields
+          (mapcar
+           (lambda (line) (and (string-match "\\_<LFACE_\\([A-Z_]+\\)_INDEX\\_>" line)
+                               (downcase (match-string 1 line))))
+           (string-lines snippet))))
+    (cl-assert (length= fields (length attrs)) t)
+    (fbs-gen-all `(table face-def ,@(mapcar (lambda (p) (cons (car p) (cadr p)))
+                                            attrs))))
+#+end_src
+
+#+RESULTS:
+#+begin_src flatbuffers :noeval :tangle test.fbs
+enum FaceWidth : ubyte {
+  ultra_condensed,
+  extra_condensed,
+  condensed,
+  semi_condensed,
+  normal,
+  semi_expanded,
+  expanded,
+  extra_expanded,
+  ultra_expanded,
+}
+enum FaceWeight : ubyte {
+  thin,
+  ultra_light,
+  light,
+  semi_light,
+  regular,
+  medium,
+  semi_bold,
+  bold,
+  extra_bold,
+  black,
+  ultra_heavy,
+}
+enum FaceSlant : ubyte {
+  reverse_oblique,
+  reverse_italic,
+  normal,
+  italic,
+  oblique,
+}
+enum UnderlineStyle : ubyte {
+  line,
+  double_line,
+  wave,
+  dots,
+  dashes,
+}
+struct FaceUnderline {
+  color: BoolColor;
+  style: UnderlineStyle;
+  position: int;
+}
+struct LineWidth {
+  vwidth: int;
+  hwidth: int;
+}
+enum BoxStyle : ubyte {
+  released_button,
+  pressed_button,
+  flat_button,
+}
+struct FaceBox {
+  line_width: LineWidth;
+  color: BoolColor;
+  style: BoxStyle;
+}
+table FaceDef {
+  family: string;
+  foundry: string;
+  height: IntFloat;
+  swidth: FaceWidth;
+  weight: FaceWeight;
+  slant: FaceSlant;
+  foreground: BoolColor;
+  distant_foreground: BoolColor;
+  background: BoolColor;
+  underline: FaceUnderline;
+  overline: BoolColor;
+  strike_through: BoolColor;
+  box: FaceBox;
+  inverse: bool;
+  stipple: int;
+  inherit: [int];
+  font: string;
+  fontset: [string];
+  extend: bool;
+}
+#+end_src
+
+** Rest
+
+*** =PixelSpec=
+
+See [[info:elisp:Pixel Specification][(elisp) Pixel Specification]]. I choose to use a bytecode for this.
+
+{{{type(PixelSpec, (table pixel-spec (expr . (vec int)) (vars . (vec string))))}}}
+
+*** =PixelSpec= bytecode
+
+See =xdisp.c=. Search for =calc_pixel_width_or_height=.
+
+#+begin_src flatbuffers :noeval
+  /// PixelSpec bytecode operators
+  ///
+  /// We use NaN boxing in the bytecode.
+  /// - Finite floats (32-bits): floating numbers
+  /// - Negative NaNs: operators
+  /// - Positive NaNs (and INF): signed 23-bit integers
+  ///
+  /// Operators: 23 bits
+  /// - Higher 3 bits: Operator type
+  /// - Lower 20 bits: Parameter
+  ///
+  /// | Operator | What       | Parameter |   Args | Explained                 |
+  /// | =0=      | =(NUM)=    | NUM       |      0 | Absolute number of pixels |
+  /// | =1=      | =UNIT=     | SYM       |      0 | Built-in symbol           |
+  /// | =2=      | =VAR=      | VAR       |      0 | Buffer-local var          |
+  /// | =3=      | =IMAGE=    | IMAGE     |      0 | Image reference           |
+  /// | =4=      | =(OP ...)= | OP + ARGC |   ARGC | Form                      |
+  enum PixelSpecOp {
+    abs_pixels,
+    unit,
+    var,
+    image,
+    form,
+  }
+  enum PixelSpecUnit {
+    in, mm, cm,
+    width, height,
+    left_fringe, right_fringe,
+    left_margin, right_margin,
+    scroll_bar, text,
+    left, center, right,
+  }
+  enum PixelSpecFormOp {
+    plus, minus, times,
+  }
+  enum PixelSpecImageType {
+    image, xwidget,
+  }
+#+end_src
+
+*** =SpacingSpec=
+
+See [[info:elisp:Specified Space][(elisp) Specified Space]].
+
+{{{type(SpacingSpec, (table spacing-spec (width . pixel-spec) (height .
+pixel-spec) (relative-width . float) (relative-height . float) (align-to .
+pixel-spec) (ascent . pixel-spec)))}}}
+
+*** =ImageSpec=
+
+See [[info:elisp:Other Display Specs][(elisp) Other Display Specs]] and then [[info:elisp:Image Descriptors][(elisp) Image Descriptors]].
+
+#+name: image-type
+#+begin_src elisp :var _=source :var _=face-util :wrap quote
+  (-->
+   (extract-snippet "image.c" "^static struct image_type const image_types\\[\\] =$" "^};$" 0)
+   extract-hard-enums
+   (delq nil it)
+   (format "{{{type(ImageType, %S)}}}"
+           `(enum image-type ,@(mapcar #'intern it))))
+#+end_src
+
+#+RESULTS: image-type
+#+begin_quote
+{{{type(ImageType, (enum image-type postscript imagemagick svg png gif tiff jpeg xpm webp xbm pbm))}}}
+#+end_quote
+
+I don't want to support =:conversion=, so I just don't include =edge-detection=
+in the =image-conversion= enum. Why, do you need edge detection in Emacs for
+image displaying?
+
+{{{type(PointerEnum)}}} (definition order matters)
+
+{{{type(ImageSpec, (table image-spec (kind . image-type) (file . string) (data .
+(vec ubyte)) (margin . (struct image-margin (x . int) (y . int))) (ascent .
+bool-int) (relief . int) (width . int) (height . int) (max-width . int)
+(max-height . int) (scale . float) (rotation . int) (flip . bool)
+(transform-smoothing . bool) (index . int) (conversion . (enum image-conversion
+none disabled)) (mask . bool-color) (pointer . pointer-enum) (map-notify .
+bool)))}}}
+
+*** =PointerEnum=
+
+#+begin_src elisp :var _=source :var _=face-util :wrap "src c :noeval"
+  (extract-snippet "xdisp.c" "^[\t ]+if (EQ (pointer, Qarrow))$" "[\t ]+}$" 0)
+#+end_src
+
+#+RESULTS:
+#+begin_src c :noeval
+      if (EQ (pointer, Qarrow))
+        cursor = FRAME_OUTPUT_DATA (f)->nontext_cursor;
+      else if (EQ (pointer, Qhand))
+        cursor = FRAME_OUTPUT_DATA (f)->hand_cursor;
+      else if (EQ (pointer, Qtext))
+        cursor = FRAME_OUTPUT_DATA (f)->text_cursor;
+      else if (EQ (pointer, Qhdrag))
+        cursor = FRAME_OUTPUT_DATA (f)->horizontal_drag_cursor;
+      else if (EQ (pointer, Qnhdrag))
+        cursor = FRAME_OUTPUT_DATA (f)->vertical_drag_cursor;
+# ifdef HAVE_X_WINDOWS
+      else if (EQ (pointer, Qvdrag))
+        cursor = FRAME_DISPLAY_INFO (f)->vertical_scroll_bar_cursor;
+# endif
+      else if (EQ (pointer, Qhourglass))
+        cursor = FRAME_OUTPUT_DATA (f)->hourglass_cursor;
+      else if (EQ (pointer, Qmodeline))
+        cursor = FRAME_OUTPUT_DATA (f)->modeline_cursor;
+      else
+        cursor = FRAME_OUTPUT_DATA (f)->nontext_cursor;
+#+end_src
+
+#+name: pointer-enum
+#+begin_src elisp :var _=source :var _=face-util :wrap quote
+  (-->
+   (extract-snippet "xdisp.c" "^[\t ]+if (EQ (pointer, Qarrow))$" "[\t ]+}$" 0)
+   extract-hard-enums
+   (delq nil it)
+   (format "{{{type(PointerEnum, %S)}}}"
+           `(enum pointer-enum ,@(mapcar #'intern it))))
+#+end_src
+
+#+RESULTS: pointer-enum
+#+begin_quote
+{{{type(PointerEnum, (enum pointer-enum arrow hand text hdrag nhdrag vdrag hourglass modeline))}}}
+#+end_quote
+
+** Property table
+
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+  (let ((ex (extract-prop-defs)))
+    (cl-loop for entry in '((prop . "TextProps") (over . "OverlayProps"))
+             concat (fbs-gen-all `(table ,(cdr entry)
+                                         ,@(mapcar
+                                            (lambda (e)
+                                              (let ((type (cdr e)))
+                                                (when (equal type '("bool" "int"))
+                                                  (setq type '("bool-int")))
+                                                (cl-assert (length= type 1) t)
+                                                (cons (car e) (car type))))
+                                            (alist-get (car entry) ex))))))
+#+end_src
+
+#+RESULTS:
+#+begin_src flatbuffers :noeval :tangle test.fbs
+table TextProps {
+  display: DisplaySpec;
+  face: FaceRef;
+  mouse_face: FaceRef;
+  fontified: bool;
+  help_echo: bool;
+  invisible: bool;
+  cursor: BoolInt;
+  pointer: PointerEnum;
+  line_spacing: LineHeight;
+  line_height: LineHeight;
+  wrap_prefix: PrefixSpec;
+  line_prefix: PrefixSpec;
+  composition: Composition;
+  display_line_numbers_disable: bool;
+}
+table OverlayProps {
+  priority: PrioritySpec;
+  window: WindowRef;
+  face: FaceRef;
+  mouse_face: FaceRef;
+  display: DisplaySpec;
+  invisible: bool;
+  before_string: EmacsString;
+  after_string: EmacsString;
+  wrap_prefix: PrefixSpec;
+  line_prefix: PrefixSpec;
+  display_line_numbers_disable: bool;
+}
+#+end_src
+
+** Display
+
+{{{type(DisplaySpec, !)}}}
+
+#+begin_src elisp :wrap "src flatbuffers :noeval :tangle test.fbs"
+  (fbs-gen-all
+   `(table display-spec
+           ,@(mapcar
+              (lambda (e)
+                (let ((name (read (car e)))
+                      (type (cdr e)))
+                  (setq name
+                        (mapconcat #'get-name (if (listp name) name (list name)) "-"))
+                  (setq type
+                        (cond
+                         ((length= type 1)
+                          (car type))
+                         ((equal type '("int" "float"))
+                          "IntFloat")
+                         (t
+                          `(union ,name ,@type))))
+                  (cons name type)))
+              (alist-get 'disp (extract-prop-defs)))))
+#+end_src
+
+#+RESULTS:
+#+begin_src flatbuffers :noeval :tangle test.fbs
+union MarginNil {
+  EmacsString,
+  ImageSpec,
+}
+union MarginLeftMargin {
+  EmacsString,
+  ImageSpec,
+}
+union MarginRightMargin {
+  EmacsString,
+  ImageSpec,
+}
+table DisplaySpec {
+  _string: EmacsString;
+  space: PixelSpec;
+  image: ImageSpec;
+  slice: SliceSpec;
+  margin_nil: MarginNil;
+  margin_left_margin: MarginLeftMargin;
+  margin_right_margin: MarginRightMargin;
+  left_fringe: FringeSpec;
+  right_fringe: FringeSpec;
+  space_width: IntFloat;
+  min_width: PixelSpec;
+  height: AnyForm;
+  raise: IntFloat;
+  when: WhenSpec;
+}
+#+end_src
+
+* Buffer Variables / Window Parameters
+
+- =tab-width=
+- =ctl-arrow=
+- =line-spacing=
+- =wrap-prefix=
+- =left-margin-width/right-margin-width=
+- =left-fringe-width/right-fringe-width=
+- =display-line-numbers=
+- =display-pixels-per-inch=
+
+** Display tables
+
+- =glyphless-char-display=
+- =buffer-display-table=
+- =standard-display-table=
+- =(window-display-table)=
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:
